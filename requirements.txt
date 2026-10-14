@@ -1,12 +1,11 @@
-# Direct dependencies; GPU JAX is selected in the README install command.
+# GPU JAX is selected in the README install command.
 jax>=0.11.1
-# Keep the grouped-matmul implementation used in the experiments.
-tokamax==0.0.13
+tokamax==0.0.13  # MoE grouped matmul (see models/quant.py: qragged_dot)
 triton; sys_platform == "linux" and platform_machine == "x86_64"
 optax
 numpy
-ml-dtypes
 transformers
+jinja2  # chat templates
 huggingface-hub
 safetensors
 datasets
@@ -14,5 +13,3 @@ verifiers
 omegaconf
 wandb
 tqdm
-jinja2
-pyyaml

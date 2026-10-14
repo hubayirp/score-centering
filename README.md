@@ -95,28 +95,54 @@ loss = (token_loss * mask).sum() / mask.sum().clamp_min(1)
 
 Full training implementation: [`losses.py`](losses.py).
 
-## Training framework: postax
+## Corrections in the trainer
 
-Score centering was developed in **postax**, a JAX framework I built for LLM full-stack research. This repo includes the full framework, with features beyond score centering:
+In [`losses.py`](losses.py) every off-policy correction is REINFORCE with a detached weight w(p/q). Each method is one point on a single `rl.is.*` grid:
+- `level`: the weight is per token or per sequence;
+- band `[low, high]`: where the ratio, or for DPPO the TV distance, may lie;
+- `outside`: what happens outside the band (`clamp` or `drop`);
+- `inside`: what happens inside it (keep the ratio, or use 1);
+- `sign`: which advantages get corrected.
 
-- pretraining, SFT, DPO, RL
-- Llama, Qwen2, Qwen3, Qwen3-MoE (load + save HF checkpoint)
-- TP, DP, FSDP, EP
+Score centering (`rl.sc=true`) subtracts the expected score under the effective sampling mass q·w, and composes with every `stat=ratio` correction. Settings not listed take their default (`level=token stat=ratio low=0 high=inf outside=drop inside=ratio sign=both`):
 
-Sampling is JIT-compiled, and sampler logprobs stay in HBM (no CPU roundtrip)!
+| Method | `rl.is.*` settings |
+| --- | --- |
+| PG (no correction) | `level=null` |
+| Naive IS | `level=token` |
+| TIS | `high=2.0 outside=clamp` |
+| MIS | `low=0.5 high=5.0` |
+| IcePop | `low=0.5 high=5.0 inside=one` |
+| PPO | `low=0.8 high=1.2 sign=ppo` |
+| DAPO | `low=0.8 high=1.28 sign=ppo` |
+| GSPO | `level=seq_mean low=0.9997 high=1.0004 sign=ppo` |
+| TOPR | `level=seq_sum high=1.0 outside=clamp sign=neg` |
+| DPPO | `stat=tv high=0.2 sign=ppo` |
+
+With the top-k sampler head (`sampler.vocab_logprobs=k`), the sampler's tail is modeled as proportional to the trainer's, rescaled to match its mass. `sampler.vocab_logprobs=full` gives exact centering.
+
+## Code
+
+The code is a small JAX stack. It loads and saves HF checkpoints for Llama, Qwen2, Qwen3 and Qwen3-MoE, and supports tensor, FSDP and expert parallelism. Sampling is JIT-compiled, and sampler logprobs stay in HBM.
+
+| File | Contents |
+| --- | --- |
+| [`train_rl.py`](train_rl.py) | Config, mismatched sampler (staleness, weight noise, int8/fp8 weights, KV-cache quantization) and training loop |
+| [`losses.py`](losses.py) | Advantages, the IS-correction grid, score centering, the RL loss |
+| [`rollout.py`](rollout.py), [`envs/`](envs) | Prompting, completion masks and scoring with [verifiers](https://github.com/PrimeIntellect-ai/verifiers) environments (Countdown, INTELLECT-2 math) |
+| [`models/`](models) | Transformer forward pass, sampling with top-k logprob collection, 8-bit quantization |
+| [`train_lm.py`](train_lm.py), [`train_dpo.py`](train_dpo.py), [`lm_utils.py`](lm_utils.py) | Minimal SFT and DPO/SimPO trainers on Hugging Face datasets, independent of the RL code |
 
 ## Example: RL run
 
-Defaults live in each trainer; override them with `key=value` arguments. For Qwen3-0.6B on Countdown with score centering:
+Defaults live in each trainer; override them with `key=value` arguments. For Qwen3-0.6B on Countdown with score centering on top of TIS:
 
 ```bash
-python train_rl.py model.source=Qwen/Qwen3-0.6B \
-  env.id=countdown env.prompt_format=chat \
-  rl.sc=true sampler.vocab_logprobs=128 \
-  opt.optimizer=sgd opt.lr=0.01
+python train_rl.py model.source=Qwen/Qwen3-0.6B env.id=countdown \
+  rl.sc=true rl.is.level=token rl.is.high=2.0 rl.is.outside=clamp
 ```
 
-Use `log.wandb_mode=disabled` to run without W&B. Models are cached in `~/.cache/postax/weights`; configurations and metrics go to `outputs/`. Pretraining/SFT and DPO use `train_lm.py` and `train_dpo.py`.
+Use `log.wandb_mode=disabled` to run without W&B. Models are cached in `~/.cache/postax/weights`, and configs and metrics go to `outputs/`.
 
 ## Paper sweeps
 
@@ -146,6 +172,8 @@ The math experiments additionally need:
 uv pip install -r requirements.txt "intellect-math==0.1.7" \
   --extra-index-url https://hub.primeintellect.ai/primeintellect/simple/
 ```
+
+`python -m pytest tests` checks that score centering cancels drift (CPU, needs `pytest`).
 
 ## Citation
 
