@@ -9,7 +9,7 @@ jinja2  # chat templates
 huggingface-hub
 safetensors
 datasets
-verifiers
+verifiers<0.4  # 0.4 moved the API under verifiers.v1
 omegaconf
 wandb
 tqdm
