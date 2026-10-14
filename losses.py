@@ -1,314 +1,183 @@
+"""REINFORCE with importance-sampling corrections and score centering.
+
+Every correction is REINFORCE with a detached weight w(r) on the ratio
+r = p/q of trainer (p) to sampler (q) probabilities, per token or per
+sequence. Score centering subtracts the expected score under the effective
+sampling mass q*w, which cancels the drift that a train/inference mismatch
+adds to the gradient; it composes with any token-level ratio correction.
+"""
 import math
-from functools import partial
 from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-import optax
 from jax.sharding import PartitionSpec as P
 
+sg = jax.lax.stop_gradient
 
-RL_REWARD_MODES = (
-    "plus_minus",
-    "plus_zero",
-    "zero_minus",
-    "group_centered",
-)
-
-
-def get_batch_targets(tokens, mask):
-    y = jnp.roll(tokens, -1, axis=1)
-    mask = jnp.roll(mask, -1, axis=1).at[:, -1].set(False)
-    return tokens, y, mask
+# advantage of a (solved, unsolved) rollout; group_centered also subtracts the group mean
+REWARD_MODES = {"plus_minus": (1.0, -1.0), "plus_zero": (1.0, 0.0),
+                "zero_minus": (0.0, -1.0), "group_centered": (1.0, -1.0)}
 
 
 def compute_advantages(rewards, group_size, reward_mode):
-    solved = np.asarray(rewards) > 0
-    match reward_mode:
-        case "plus_minus" | "group_centered":
-            advantages = np.where(solved, 1.0, -1.0)
-        case "plus_zero":
-            advantages = np.where(solved, 1.0, 0.0)
-        case "zero_minus":
-            advantages = np.where(solved, 0.0, -1.0)
-        case _:
-            raise ValueError(
-                f"reward_mode must be one of {RL_REWARD_MODES}, "
-                f"not {reward_mode!r}")
-    advantages = advantages.astype(np.float32)
+    solved, unsolved = REWARD_MODES[reward_mode]
+    advantages = np.where(np.asarray(rewards) > 0, solved, unsolved).astype(np.float32)
     if reward_mode == "group_centered":
         groups = advantages.reshape(-1, group_size)
-        advantages = (groups - groups.mean(axis=1, keepdims=True)).reshape(-1)
+        advantages = (groups - groups.mean(1, keepdims=True)).reshape(-1)
     return advantages
 
 
-IS_LEVELS = ("token", "seq_mean", "seq_sum")
-IS_STATS = ("ratio", "tv")
-IS_OUTSIDE = ("clamp", "drop")
-IS_INSIDE = ("ratio", "one")
-IS_SIGNS = ("both", "neg", "pos", "ppo")
-
-DUAL_CLIP = 3.0  # PPO band top for A < 0 (arXiv:1912.09729); adopted, never tuned
+DUAL_CLIP = 3.0  # PPO's ratio bound for negative advantages (arXiv:1912.09729)
 
 
 class ISCorrection(NamedTuple):
-    """One point on the IS-correction grid; the named methods (TIS/CISPO,
-    MIS, IcePop, PPO/DAPO, GSPO, TOPR, DPPO) are spellings of it — table in
-    README.md. Weights are always detached REINFORCE coefficients."""
-    level: str = "token"   # token | seq_mean (mean log r) | seq_sum (sum log r)
-    stat: str = "ratio"    # band statistic: the ratio r = p/q, or the binary
-                           # TV divergence |q - p| (DPPO, arXiv:2602.04879)
-    low: float = 0.0       # trust band; 0 / inf = open side (tv: high = delta)
+    """One point on the IS-correction grid. TIS, MIS, IcePop, PPO, DAPO, GSPO,
+    TOPR and DPPO are all spellings of it (table in README.md)."""
+    level: str = "token"   # token | seq_mean (mean log r) | seq_sum (sum log r: trajectory ratio)
+    stat: str = "ratio"    # band tests the ratio r, or the TV distance |q - p| (DPPO; high = delta)
+    low: float = 0.0       # band [low, high] on r; 0 / inf leave a side open
     high: float = math.inf
-    outside: str = "drop"  # clamp = pull weight to the nearest bound | drop = 0
-    inside: str = "ratio"  # ratio = keep the IS weight | one = plain gradient
-    sign: str = "both"     # both | neg | pos = advantages corrected (rest w=1)
-                           # ppo = block only moves away from the sampler:
-                           # ratio: pos (0, high], neg [low, DUAL_CLIP];
-                           # tv: pos r>1, neg r<1, when tv > high (no dual clip)
-    def in_band(self, r, positive, tv):
-        if self.stat == "tv":
-            if self.sign == "ppo":
-                return jnp.where(positive, (r <= 1.0) | (tv <= self.high),
-                                 (r >= 1.0) | (tv <= self.high))
-            return tv <= self.high
-        if self.sign == "ppo":
-            return jnp.where(
-                positive, r <= self.high, (r >= self.low) & (r <= DUAL_CLIP))
-        return (r >= self.low) & (r <= self.high)
+    outside: str = "drop"  # clamp: w = nearest bound | drop: w = 0
+    inside: str = "ratio"  # ratio: w = r | one: w = 1 (plain gradient)
+    sign: str = "both"     # which advantages get corrected: both | neg | pos (others w = 1)
+                           # | ppo: block only moves away from q; A>0: (0, high], A<0: [low, DUAL_CLIP]
+
+    def check(self):
+        choices = dict(level=("token", "seq_mean", "seq_sum"), stat=("ratio", "tv"),
+                       outside=("clamp", "drop"), inside=("ratio", "one"),
+                       sign=("both", "neg", "pos", "ppo"))
+        for field, allowed in choices.items():
+            assert getattr(self, field) in allowed, f"rl.is.{field} must be one of {allowed}"
+        assert self.stat == "ratio" or self.level != "seq_sum", "seq_sum requires stat=ratio"
+        return self
 
 
-def is_weights(log_ratio, positive, c, tv=None):
-    """Detached IS weight on r = exp(log_ratio), clamped to e**+-20. For
-    level=seq_mean uses per-sequence means for log_ratio (and tv), while
-    level=seq_sum uses the per-sequence sum (the full trajectory ratio).
-    stat=tv gates the same weight on the tv statistic instead."""
-    r = jnp.exp(jnp.clip(log_ratio, -20.0, 20.0))
-    w = jnp.where(
-        c.in_band(r, positive, tv),
-        r if c.inside == "ratio" else 1.0,
-        jnp.clip(r, c.low, c.high) if c.outside == "clamp" else 0.0)
-    if c.sign == "neg":
-        w = jnp.where(positive, 1.0, w)
-    if c.sign == "pos":
-        w = jnp.where(positive, w, 1.0)
-    return jax.lax.stop_gradient(w)
-
-
-def centering_weights(vocab_logprobs, sampling_logprobs, positive, c):
-    """Effective centering mass q*w for a pointwise ratio correction.
-
-    The calculation stays in log space, so the common in-band case
-    q * (p/q) = p is exact and cannot overflow. The same helper operates on
-    the full vocabulary, the exact top-k head, and one representative token
-    for the modeled top-k tail.
-    """
-    lo = (sampling_logprobs + math.log(c.low)
-          if c.low > 0 else -math.inf)
-    hi = (sampling_logprobs + math.log(c.high)
-          if not math.isinf(c.high) else math.inf)
-    if c.sign == "ppo":
-        in_band = jnp.where(
-            positive[..., None], vocab_logprobs <= hi,
-            (vocab_logprobs >= lo)
-            & (vocab_logprobs <= sampling_logprobs + math.log(DUAL_CLIP)))
+def log_mass(log_p, log_q, positive, c, tv=None):
+    """log(q * w(p/q)): a token's effective sampling mass under correction c
+    (-inf where w = 0, log q for no correction). Log space keeps the common
+    in-band case q * (p/q) = p exact and overflow-free. The same function gives
+      the IS weight w(r)       as the mass at p = r, q = 1,
+      the centering mass q*w   as the mass at (p, q),
+      the top-k tail factor    rho * w(1/rho) as the mass at p = 1, q = rho."""
+    if c is None:
+        return log_q
+    lo = log_q + math.log(c.low) if c.low > 0 else -math.inf
+    hi = log_q + math.log(c.high) if c.high < math.inf else math.inf
+    if c.stat == "tv":
+        in_band = tv <= c.high
+        if c.sign == "ppo":
+            in_band |= jnp.where(positive, log_p <= log_q, log_p >= log_q)
+    elif c.sign == "ppo":
+        in_band = jnp.where(positive, log_p <= hi,
+                            (log_p >= lo) & (log_p <= log_q + math.log(DUAL_CLIP)))
     else:
-        in_band = (vocab_logprobs >= lo) & (vocab_logprobs <= hi)
-    w = jnp.exp(jnp.where(
-        in_band,
-        vocab_logprobs if c.inside == "ratio" else sampling_logprobs,
-        jnp.clip(vocab_logprobs, lo, hi) if c.outside == "clamp" else -jnp.inf))
+        in_band = (log_p >= lo) & (log_p <= hi)
+    log_m = jnp.where(in_band, log_p if c.inside == "ratio" else log_q,
+                      jnp.clip(log_p, lo, hi) if c.outside == "clamp" else -jnp.inf)
     if c.sign == "neg":
-        w = jnp.where(positive[..., None], jnp.exp(sampling_logprobs), w)
+        log_m = jnp.where(positive, log_q, log_m)
     if c.sign == "pos":
-        w = jnp.where(positive[..., None], w, jnp.exp(sampling_logprobs))
-    return w
+        log_m = jnp.where(positive, log_m, log_q)
+    return log_m
 
 
-def take_vocab(vocab_logprobs, ids):
-    """take_along_axis on [B, C, V] whose vocab axis may be TP-sharded:
-    the gather output drops that axis, so its sharding must be explicit."""
-    spec = jax.typeof(vocab_logprobs).sharding.spec
+def is_weight(log_ratio, positive, c, tv=None):
+    """Detached IS weight w(r), with r = exp(log_ratio) clipped to e^±20."""
+    return sg(jnp.exp(log_mass(jnp.clip(log_ratio, -20.0, 20.0), 0.0, positive, c, tv)))
+
+
+def take_vocab(logp, ids):
+    """take_along_axis over a [B, C, V] vocab axis that may be TP-sharded (the
+    gather drops that axis, so its output sharding must be explicit)."""
+    spec = jax.typeof(logp).sharding.spec
     if spec[-1] is None:
-        return jnp.take_along_axis(vocab_logprobs, ids, -1)
+        return jnp.take_along_axis(logp, ids, -1)
     b = jnp.arange(ids.shape[0])[:, None, None]
     c = jnp.arange(ids.shape[1])[None, :, None]
-    return vocab_logprobs.at[b, c, ids].get(out_sharding=P(*spec[:-1], None))
+    return logp.at[b, c, ids].get(out_sharding=P(*spec[:-1], None))
 
 
-def loss_fn_rl(hidden, head, batch, is_cfg=None, chunk=128,
-               score_center=False):
-    """REINFORCE and diagnostics using logprobs recorded during sampling.
+def loss_fn_rl(hidden, head, batch, correction=None, score_center=False, chunk=128):
+    """REINFORCE loss on sampled rollouts, with an optional ISCorrection and
+    score centering. Returns (loss, metrics).
 
-    is_cfg (ISCorrection) reweights REINFORCE with detached IS weights on the
-    p/q ratio: per token (level=token; the ppo shape is gradient-identical to
-    the clipped surrogate), or one weight per sequence, applied after the
-    scan. level=seq_mean uses the geometric-mean ratio; level=seq_sum uses the
-    full trajectory ratio (the product of token ratios). Token-level ratio
-    corrections compose with score centering by integrating under the
-    effective mass q*w; TV corrections deliberately do not compose with score
-    centering.
+    hidden [B, T, D] are pre-head activations and head maps them to logits.
+    The head, log-softmax and all full-vocabulary float32 intermediates run in
+    rematerialized chunks of `chunk` positions, so only [B, chunk, V] is live.
 
-    head maps pre-head activations [B, C, D] to logits [B, C, V]. It runs
-    together with the loss in rematerialized sequence chunks, so the
-    full-vocabulary float32 intermediates (log-softmax, centering weights and
-    their cotangents) only ever cover `chunk` positions per device at a time.
-
-    When score_center is enabled, the batch determines the estimator. Full
-    sampler logprobs give exact centering; otherwise the transported top-k
-    head is exact and q's tail is modeled as proportional to the trainer's p.
-    Every ratio correction is constant over that modeled tail, so its
-    effective mass is alpha*p and the zero-expected-score identity leaves only
-    top-k gathers in the centering backward pass.
+    batch: tokens, mask (completion tokens), advantages [B],
+    sampling_token_logprobs, and for score centering either the sampler's full
+    logprobs sampling_vocab_logprobs [B, T, V] (exact) or its top-k head
+    center_ids / center_logprobs [B, T, k]. With the head, q's tail is modeled
+    as rho * p (rho matches the tail mass). Every ratio correction is constant
+    on that tail, so its centering term is alpha * E_p[log p], whose gradient is
+    zero: the backward pass only touches the k gathered logprobs.
     """
-    token_c = is_cfg if is_cfg and is_cfg.level == "token" else None
-    seq_c = (is_cfg if is_cfg and is_cfg.level in ("seq_mean", "seq_sum")
-             else None)
-    if is_cfg and is_cfg.level == "seq_sum" and is_cfg.stat != "ratio":
-        raise ValueError("level=seq_sum requires stat=ratio")
-    if score_center and is_cfg and is_cfg.stat != "ratio":
-        raise ValueError("score centering composes only with stat=ratio")
-    full_center = score_center and "sampling_vocab_logprobs" in batch
-    topk_center = (
-        score_center and not full_center and "center_ids" in batch)
-    if score_center and not (full_center or topk_center):
-        raise ValueError(
-            "score centering requires full or top-k sampler vocab logprobs")
-    _, target_tokens, target_mask = get_batch_targets(batch["tokens"], batch["mask"])
-    seq_len = target_tokens.shape[1]
-    chunk = next(c for c in range(min(chunk, seq_len), 0, -1) if seq_len % c == 0)
+    c = correction
+    token_c = c if c and c.level == "token" else None
+    seq_c = c if c and c.level != "token" else None
+    full = "sampling_vocab_logprobs" in batch
+    if score_center:
+        assert full or "center_ids" in batch, "score centering needs sampler vocab logprobs"
+        assert not c or c.stat == "ratio", "score centering composes only with stat=ratio"
+    targets = jnp.roll(batch["tokens"], -1, axis=1)
+    mask = jnp.roll(batch["mask"], -1, axis=1).at[:, -1].set(False)
+    positive = batch["advantages"][:, None] >= 0
+    seq_len = targets.shape[1]
+    chunk = next(n for n in range(min(chunk, seq_len), 0, -1) if seq_len % n == 0)
+    per_token = {"hidden": hidden, "targets": targets, "mask": mask} | {
+        k: batch[k] for k in ("sampling_token_logprobs", "sampling_vocab_logprobs",
+                              "center_ids", "center_logprobs") if k in batch}
 
     def chunk_sums(sums, start):
-        slc = lambda x: jax.lax.dynamic_slice_in_dim(x, start, chunk, axis=1)
-        sg = jax.lax.stop_gradient
-        logits = head(slc(hidden))
-        vocab_logprobs = jax.nn.log_softmax(logits.astype(jnp.float32))
-        token_logprobs = take_vocab(
-            vocab_logprobs, slc(target_tokens)[..., None])[..., 0]
-        log_ratio = token_logprobs - slc(batch["sampling_token_logprobs"])
-        positive = batch["advantages"][:, None] >= 0
-        tv = None
-        if is_cfg and is_cfg.stat == "tv":
-            tv = jnp.abs(jnp.exp(slc(batch["sampling_token_logprobs"]))
-                         - jnp.exp(token_logprobs))
-        importance_weights = 1.0
-        if token_c:
-            importance_weights = is_weights(log_ratio, positive, token_c, tv)
-        score = importance_weights * token_logprobs
-        # Negative entropy of the trainer distribution: a metric, and the
-        # full-vocab factor of the pmodel tail. Detached — its logit gradient
-        # is identically zero (E_p[grad log p] = 0), so backward never touches
-        # the full vocabulary (see the paper's top-k derivation).
-        plogp = sg((sg(jnp.exp(vocab_logprobs)) * vocab_logprobs).sum(-1))
+        b = {k: jax.lax.dynamic_slice_in_dim(v, start, chunk, axis=1) for k, v in per_token.items()}
+        logp_vocab = jax.nn.log_softmax(head(b["hidden"]).astype(jnp.float32))
+        logp = take_vocab(logp_vocab, b["targets"][..., None])[..., 0]
+        logq = b["sampling_token_logprobs"]
+        tv = sg(jnp.abs(jnp.exp(logq) - jnp.exp(logp)))
+        w = is_weight(logp - logq, positive, token_c, tv)
+        plogp = sg((jnp.exp(logp_vocab) * logp_vocab).sum(-1))  # E_p[log p] has zero gradient
+        terms = {"score": w * logp, "entropy": -plogp, "kl_samp_train": sg(logq - logp),
+                 "masked": w == 0, "tv": tv}
+        if score_center and full:
+            logq_vocab = b["sampling_vocab_logprobs"].astype(jnp.float32)
+            mass = jnp.exp(log_mass(logp_vocab, logq_vocab, positive[..., None], token_c))
+            terms["score"] -= (sg(mass) * logp_vocab).sum(-1)
+        if "center_ids" in b:
+            logp_head, logq_head = take_vocab(logp_vocab, b["center_ids"]), b["center_logprobs"]
+            p_head, q_head = sg(jnp.exp(logp_head)), jnp.exp(logq_head)
+            q_tail = 1.0 - q_head.sum(-1)
+            rho = jnp.maximum(q_tail, 0.0) / jnp.maximum(1.0 - p_head.sum(-1), 1e-6)
+            terms["kl_head"] = sg((q_head * (logq_head - logp_head)).sum(-1)
+                                  + q_tail * jnp.log(jnp.maximum(rho, 1e-9)))
+            if score_center:
+                alpha = jnp.exp(log_mass(0.0, jnp.log(rho), positive, token_c))
+                mass = jnp.exp(log_mass(logp_head, logq_head, positive[..., None], token_c))
+                residual = mass - alpha[..., None] * p_head
+                terms["score"] -= (sg(residual) * logp_head).sum(-1) + sg(alpha * plogp)
+        return {k: s + (terms[k] * b["mask"]).sum(-1) for k, s in sums.items()}, None
 
-        head_q = head_p = None
-        if "center_ids" in batch:
-            head_q = slc(batch["center_logprobs"])
-            head_p = take_vocab(vocab_logprobs, slc(batch["center_ids"]))
+    keys = ["score", "entropy", "kl_samp_train", "masked", "tv"]
+    keys += ["kl_head"] if "center_ids" in batch else []
+    zeros = jnp.zeros_like(batch["advantages"], dtype=jnp.float32)  # per-sequence sums
+    sums, _ = jax.lax.scan(jax.checkpoint(chunk_sums), dict.fromkeys(keys, zeros),
+                           jnp.arange(0, seq_len, chunk))
 
-        center = None
-        if full_center:
-            sampling_vocab_logprobs = slc(batch["sampling_vocab_logprobs"]).astype(jnp.float32)
-            cw = (centering_weights(
-                      vocab_logprobs, sampling_vocab_logprobs, positive, token_c)
-                  if token_c else jnp.exp(sampling_vocab_logprobs))
-            center = (sg(cw) * vocab_logprobs).sum(-1)
-        if topk_center:
-            # Apply the same correction to the exact transported head as the
-            # full path applies to every vocabulary token.
-            head_cw = (centering_weights(head_p, head_q, positive, token_c)
-                       if token_c else jnp.exp(head_q))
-            center = (sg(head_cw) * head_p).sum(-1)
-
-            # Model q_tail = rho*p_tail, matching its transported mass. Since
-            # p/q = 1/rho is constant there, every ratio correction produces
-            # effective tail mass alpha*p. Evaluate alpha with one synthetic
-            # p=1, q=rho token so band/sign semantics remain centralized in
-            # centering_weights rather than being reimplemented here.
-            tail_q_mass = jnp.maximum(1.0 - jnp.exp(head_q).sum(-1), 0.0)
-            p_head = jnp.exp(head_p)
-            rho = tail_q_mass / jnp.maximum(1.0 - p_head.sum(-1), 1e-6)
-            alpha = rho
-            if token_c:
-                alpha = centering_weights(
-                    jnp.zeros_like(rho)[..., None],
-                    jnp.log(rho)[..., None], positive, token_c)[..., 0]
-            # The head gather stays in the graph: only the full sum is
-            # zero-gradient, a partial sum over the head is not.
-            center += sg(alpha) * (
-                plogp - (sg(p_head) * head_p).sum(-1))
-        if center is not None:
-            score = score - center
-
-        mask = slc(target_mask)
-        sums = dict(sums)
-        if head_q is not None:
-            # Head-based KL(q||p) with the tail modeled as q = r*p (exact when
-            # q's tail is proportional to p's): tail contribution = tail * log r.
-            q_head = jnp.exp(head_q)
-            q_mass = q_head.sum(-1)
-            r = ((1.0 - q_mass)
-                 / jnp.maximum(1.0 - jnp.exp(head_p).sum(-1), 1e-6))
-            kl_head = ((q_head * (head_q - head_p)).sum(-1)
-                       + (1.0 - q_mass) * jnp.log(jnp.maximum(r, 1e-9)))
-            sums["kl_head"] += (kl_head * mask).sum()
-            sums["head_mass"] += (q_mass * mask).sum()
-        sums["score"] += (score * mask).sum(-1)
-        sums["entropy"] += (-plogp * mask).sum()
-        sums["absdiff"] += (
-            jnp.abs(slc(batch["sampling_token_logprobs"]) - token_logprobs)
-            * mask
-        ).sum()
-        # Signed mean = E_q[log q - log p] on sampled tokens = KL(q||p) estimate;
-        # matches molt's vllm_kl so mismatch is comparable across the two setups.
-        sums["kl_samp_train"] += (
-            (slc(batch["sampling_token_logprobs"]) - token_logprobs) * mask
-        ).sum()
-        if seq_c:
-            sums["log_ratio"] += (sg(log_ratio) * mask).sum(-1)
-            if tv is not None:
-                sums["tv"] += (sg(tv) * mask).sum(-1)
-        if token_c and token_c.outside == "drop":
-            sums["masked"] += ((importance_weights == 0.0) * mask).sum()
-        return sums, None
-
-    scalar = jnp.zeros((), jnp.float32)
-    # Per-sequence accumulators inherit the advantages' [B] sharding so the
-    # scan carry type is stable.
-    per_seq = jnp.zeros_like(batch["advantages"], dtype=jnp.float32)
-    init = {"score": per_seq, "entropy": scalar, "absdiff": scalar,
-            "kl_samp_train": scalar, "masked": scalar}
+    n_tokens = jnp.maximum(mask.sum(), 1)
+    advantages = batch["advantages"]
+    frac_masked = sums["masked"].sum() / n_tokens
     if seq_c:
-        init["log_ratio"] = per_seq
-        if seq_c.stat == "tv":
-            init["tv"] = per_seq
-    if "center_ids" in batch:
-        init.update(kl_head=scalar, head_mass=scalar)
-    sums, _ = jax.lax.scan(
-        jax.checkpoint(chunk_sums), init, jnp.arange(0, seq_len, chunk))
-    count = jnp.maximum(target_mask.sum(), 1)
-    weight = batch["advantages"]
-    frac_masked = sums["masked"] / count
-    if seq_c:
-        seq_count = jnp.maximum(target_mask.sum(1), 1)
-        seq_log_ratio = sums["log_ratio"]
+        seq_tokens = jnp.maximum(mask.sum(1), 1)
+        log_ratio = -sums["kl_samp_train"]
         if seq_c.level == "seq_mean":
-            seq_log_ratio = seq_log_ratio / seq_count
-        w_seq = is_weights(
-            seq_log_ratio, batch["advantages"] >= 0, seq_c,
-            sums["tv"] / seq_count if seq_c.stat == "tv" else None)
-        weight = weight * w_seq
-        if seq_c.outside == "drop":
-            frac_masked = (w_seq == 0.0).mean()  # fraction of sequences
-    loss = -(weight * sums["score"]).sum() / count
-    metrics = {
-        "pol_entropy": sums["entropy"] / count,
-        "logp_absdiff_samp_train": sums["absdiff"] / count,
-        "kl_samp_train": sums["kl_samp_train"] / count,
-        "frac_masked": frac_masked,
-    }
-    if "center_ids" in batch:
-        metrics["kl_head"] = sums["kl_head"] / count
-        metrics["head_mass"] = sums["head_mass"] / count
-    return loss, metrics
+            log_ratio = log_ratio / seq_tokens
+        w = is_weight(log_ratio, advantages >= 0, seq_c, sums["tv"] / seq_tokens)
+        advantages = advantages * w
+        frac_masked = (w == 0).mean()  # fraction of sequences
+    loss = -(advantages * sums["score"]).sum() / n_tokens
+    metrics = {k: sums[k].sum() / n_tokens for k in ("entropy", "kl_samp_train", "kl_head") if k in sums}
+    metrics["pol_entropy"] = metrics.pop("entropy")
+    return loss, metrics | {"frac_masked": frac_masked}
