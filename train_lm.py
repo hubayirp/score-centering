@@ -1,236 +1,86 @@
+"""Supervised fine-tuning: next-token prediction on a Hugging Face dataset
+(format=text trains on all tokens, format=chat on assistant turns only)."""
 from functools import partial
-from itertools import chain, count
 
-from tasks import data
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
-import timing
 import wandb
 from tqdm.auto import tqdm
 
-from tasks.evals import run_evals
-import losses
+import lm_utils
 import models
 import utils
 
 
 DEFAULT_CFG = """
 model:
-  source: null
+  source: Qwen/Qwen3-0.6B
   weights_dir: ~/.cache/postax/weights
-  init: pretrained
-  tp_size: 1
-  dp_shard: false
-  hidden_size: null
-  num_hidden_layers: null
-train:
-  dataset: null
-  split: null
-  seq_len: null
-  batch_size: null
-  num_tokens_valid: 0
-reg:
-  dataset: null
-  split: null
-  seq_len: null
-  batch_size: null
-  method: null
-  coeff: 0.0
-  synth: false
-  buffer: 1
+  tp: 1
+data:
+  path: allenai/tulu-3-sft-olmo-2-mixture-0225
+  name: null
+  split: train
+  format: chat  # text | chat
+  seq_len: 2048
+  batch_size: 32
+  valid_rows: 512
 opt:
-  n_epochs: 1
-  tokens: null
   optimizer: adamw
-  lr: 1e-4
-  b2: 0.997
-  warmup_tokens: 10_000_000
-  ema_halflife: null
+  lr: 1e-5
+  epochs: 1
 log:
-  project: postax
+  project: postax-lm
   wandb_mode: online
   dir: ./outputs
   run_name: null
+  every_steps: 10
+  valid_every_steps: 200
   save_model: false
-  evals: []
-  every_tokens: 1_000_000
-  eval_every_tokens: 20_000_000
-  num_tokens_eval: 1_000_000
-  num_examples_eval: null
 run:
   seed: 0
 """
 
 
-def train(cfg) -> None:
-    _, key_model = jax.random.split(jax.random.key(cfg.run.seed))
-    with timing.context("load model"):
-        model = models.load(
-            str(cfg.model.source),
-            cfg.model.weights_dir,
-            tp_size=cfg.model.tp_size,
-            dp_shard=cfg.model.dp_shard,
-            init=cfg.model.init,
-            hidden_size=cfg.model.hidden_size,
-            num_hidden_layers=cfg.model.num_hidden_layers,
-            key=key_model,
-        )
-    model.weights = jax.tree.map(lambda x: x.astype(jnp.float32), model.weights)
-    model.forward = jax.jit(model.forward)
-    n_params = sum(w.size for w in jax.tree.leaves(model.weights))
-    print(f"{n_params=:_}")
-    weights_pi = jax.tree.map(lambda x: x.astype(jnp.bfloat16), model.weights)
-    with timing.context("load datasets"):
-        train_len, make_train, make_valid = data.load(cfg.train.dataset, cfg.train.split, cfg.train.batch_size, cfg.train.seq_len, model.tokenizer, seed=cfg.run.seed, num_tokens_valid=cfg.train.num_tokens_valid)
-        _, make_reg, _ = (
-            (None, None, None)
-            if cfg.reg.dataset is None
-            else data.load(
-                cfg.reg.dataset, cfg.reg.split, cfg.reg.batch_size, cfg.reg.seq_len, model.tokenizer, seed=cfg.run.seed
-            )
-        )
-    ds_train_eval = chain.from_iterable(make_train(epoch) for epoch in count())
-    ds_reg = None if make_reg is None else chain.from_iterable(make_reg(epoch) for epoch in count())
-    ds_reg_eval = None if make_reg is None else chain.from_iterable(make_reg(epoch) for epoch in count())
-    tokens_per_batch, total_steps, target_tokens, streaming_train = utils.compute_training_schedule(train_len, cfg.train, cfg.opt)
-    optimizer, opt_state = utils.make_optimizer(cfg.opt, total_steps, model.weights, tokens_per_batch)
+def train(cfg):
+    model = models.load(cfg.model.source, cfg.model.weights_dir, tp=cfg.model.tp)
+    model.weights = jax.tree.map(lambda w: w.astype(jnp.float32), model.weights)
+    make_train, valid_batches = lm_utils.load_batches(cfg.data, model.tokenizer, cfg.run.seed)
+    optimizer = utils.make_optimizer(cfg.opt.optimizer, cfg.opt.lr)
+    opt_state = optimizer.init(model.weights)
     run_dir = utils.start_run(cfg)
-    ema_weights = None if not cfg.opt.ema_halflife else jax.tree.map(jnp.copy, model.weights)
-    synth_key = jax.random.key(cfg.run.seed)
-    synth_reg_iter = iter(())
-
-    def loss_fn(weights_theta, weights_pi, batch_train, batch_reg=None):
-        primary_loss_avg, primary_loss_sum, primary_num_tokens = losses.loss_fn_ntp(model.forward, weights_theta, batch_train)
-        reg_loss_avg = losses.loss_fn_reg(model.forward, weights_theta, weights_pi, batch_train, batch_reg, cfg.reg, primary_loss_avg.dtype)
-        optim_loss_avg = primary_loss_avg + cfg.reg.coeff * reg_loss_avg
-        return optim_loss_avg, (reg_loss_avg, primary_loss_sum, primary_num_tokens)
-
-    @partial(jax.jit, donate_argnames=("weights_theta", "opt_state"))
-    def opt_step(weights_theta, weights_pi, opt_state, batch_train, batch_reg=None):
-        (optim_loss_avg, (reg_loss_avg, primary_loss_sum, primary_num_tokens)), grads = jax.value_and_grad(loss_fn, argnums=0, has_aux=True)(weights_theta, weights_pi, batch_train, batch_reg)
-        updates, opt_state = optimizer.update(grads, opt_state, weights_theta)
-        weights_theta = optax.apply_updates(weights_theta, updates)
-        batch_losses = {"optim_loss_avg": optim_loss_avg, "reg_loss_avg": reg_loss_avg, "primary_loss_sum": primary_loss_sum, "primary_num_tokens": primary_num_tokens}
-        return weights_theta, opt_state, batch_losses
 
     @jax.jit
-    def update_ema_weights(ema_weights, weights, ema_decay):
-        return jax.tree.map(lambda ema, w: ema_decay * ema + (1.0 - ema_decay) * w, ema_weights, weights)
+    def loss_fn(weights, batch):
+        logp, mask = lm_utils.logprobs(model.forward, weights, batch["tokens"], batch["mask"])
+        return -(logp * mask).sum() / jnp.maximum(mask.sum(), 1)
 
-    pending_metrics = None
-    step = masked_tokens_seen = total_tokens_seen = 0
-    if cfg.log.every_tokens <= 0:
-        raise ValueError("log.every_tokens must be positive")
-    if cfg.log.eval_every_tokens <= 0:
-        raise ValueError("log.eval_every_tokens must be positive")
-    next_log_at = next_eval_at = 0
-    interval_reg_loss_avg_sum = interval_optim_loss_avg_sum = interval_primary_loss_sum = 0.0
-    interval_steps = interval_primary_tokens = epoch_tokens = code_len_model_and_data = 0
-    train_batches = ((epoch, batch_train) for epoch in (count() if streaming_train else range(cfg.opt.n_epochs)) for batch_train in make_train(epoch))
-    pbar = tqdm(total=total_steps, desc="Train") if jax.process_index() == 0 else None
+    @partial(jax.jit, donate_argnums=(0, 1))
+    def train_step(weights, opt_state, batch):
+        loss, grads = jax.value_and_grad(loss_fn)(weights, batch)
+        updates, opt_state = optimizer.update(grads, opt_state, weights)
+        return optax.apply_updates(weights, updates), opt_state, loss
 
-    for epoch, batch_train in train_batches:
+    step = 0
+    for epoch in range(cfg.opt.epochs):
+        for batch in tqdm(make_train(epoch), desc=f"epoch {epoch}"):
+            metrics = {}
+            if valid_batches and step % cfg.log.valid_every_steps == 0:
+                metrics["valid_loss"] = np.mean([loss_fn(model.weights, b) for b in valid_batches])
+            model.weights, opt_state, loss = train_step(model.weights, opt_state, batch)
+            if step % cfg.log.every_steps == 0:
+                metrics |= {"epoch": epoch, "loss": loss}
+            if metrics:
+                utils.log_metrics(step, metrics, run_dir)
+            step += 1
 
-        # logging
-        should_log = total_tokens_seen >= next_log_at
-        should_eval = total_tokens_seen >= next_eval_at
-        if should_log or should_eval:
-            if should_log:
-                while total_tokens_seen >= next_log_at:
-                    next_log_at += cfg.log.every_tokens
-            eval_metrics = {
-                "step": step,
-                "epoch": epoch,
-                "masked_tokens_seen": masked_tokens_seen,
-                "total_tokens_seen": total_tokens_seen,
-                "weight_norm": utils.weight_norm(model.weights),
-                "epiplexity": 0,
-            }
-            if should_log and step > 0:
-                interval_reg_loss_avg = interval_reg_loss_avg_sum / interval_steps
-                primary_loss_avg = interval_primary_loss_sum / interval_primary_tokens
-                code_len_data_given_model = primary_loss_avg * min(masked_tokens_seen, epoch_tokens)
-                code_len_model = code_len_model_and_data - code_len_data_given_model
-                eval_metrics |= {
-                    "loss/optim": interval_optim_loss_avg_sum / interval_steps,
-                    "loss/primary": primary_loss_avg,
-                    "loss/regularization": interval_reg_loss_avg,
-                    "loss/regularization_weighted": cfg.reg.coeff * interval_reg_loss_avg,
-                    "epiplexity": code_len_model,
-                }
-                interval_reg_loss_avg_sum = interval_optim_loss_avg_sum = interval_primary_loss_sum = 0.0
-                interval_steps = interval_primary_tokens = 0
-            if should_eval:
-                while total_tokens_seen >= next_eval_at:
-                    next_eval_at += cfg.log.eval_every_tokens
-                eval_metrics |= run_evals(cfg.log.evals, model, weights_pi, ds_train_eval, ds_reg_eval, None, run_dir, step, epoch, tokens_per_batch, cfg.train.split, cfg.log.num_tokens_eval, cfg.log.num_examples_eval)
-                if make_valid is not None:
-                    eval_metrics |= losses.eval_lm_valid(model, make_valid)
-                if ema_weights is not None:
-                    train_weights, model.weights = model.weights, ema_weights
-                    ema_eval_metrics = run_evals(cfg.log.evals, model, weights_pi, ds_train_eval, ds_reg_eval, None, run_dir / "ema", step, epoch, tokens_per_batch, cfg.train.split, cfg.log.num_tokens_eval, cfg.log.num_examples_eval)
-                    if make_valid is not None:
-                        ema_eval_metrics |= losses.eval_lm_valid(model, make_valid)
-                    model.weights = train_weights
-                    eval_metrics |= {f"{name}_ema": value for name, value in ema_eval_metrics.items()}
-            if pending_metrics is not None: utils.log_metrics(*pending_metrics, run_dir)
-            pending_metrics = step, eval_metrics
-
-        # train step
-        batch_reg = None
-        if cfg.reg.method in ("ntp_pre", "kl_pre"):
-            if cfg.reg.synth:
-                try:
-                    batch_reg = next(synth_reg_iter)
-                except StopIteration:
-                    synth_key, key_reg = jax.random.split(synth_key)
-                    synth_reg_batches = utils.sample_synthetic_lm_batches(
-                        key_reg, model, weights_pi, cfg.reg.batch_size, cfg.reg.seq_len, cfg.reg.buffer
-                    )
-                    synth_reg_iter = (jax.tree.map(lambda x: x[i], synth_reg_batches) for i in range(cfg.reg.buffer))
-                    batch_reg = next(synth_reg_iter)
-            else:
-                batch_reg = next(ds_reg)
-        model.weights, opt_state, batch_losses = opt_step(model.weights, weights_pi, opt_state, batch_train, batch_reg)
-        if ema_weights is not None:
-            ema_halflife_tokens = cfg.opt.ema_halflife * (total_tokens_seen + tokens_per_batch)
-            ema_decay = 0.5 ** (tokens_per_batch / ema_halflife_tokens)
-            ema_weights = update_ema_weights(ema_weights, model.weights, ema_decay)
-
-        # logging
-        interval_optim_loss_avg_sum += batch_losses["optim_loss_avg"]
-        interval_reg_loss_avg_sum += batch_losses["reg_loss_avg"]
-        interval_primary_loss_sum += batch_losses["primary_loss_sum"]
-        interval_primary_tokens += batch_losses["primary_num_tokens"]
-        if epoch == 0:
-            epoch_tokens += batch_losses["primary_num_tokens"]
-            code_len_model_and_data += batch_losses["primary_loss_sum"]
-        step += 1
-        interval_steps += 1
-        masked_tokens_seen += batch_losses["primary_num_tokens"]
-        total_tokens_seen += tokens_per_batch
-        if pbar is not None:
-            pbar.update(1)
-
-        if total_tokens_seen >= target_tokens:
-            break
-
-    if pbar is not None:
-        pbar.close()
-    utils.log_metrics(*pending_metrics, run_dir)
-    if cfg.log.save_model:
-        utils.save_model(model, run_dir, "final_model")
-        if ema_weights is not None:
-            train_weights, model.weights = model.weights, ema_weights
-            utils.save_model(model, run_dir, "final_model_ema")
-            model.weights = train_weights
-    if jax.process_index() == 0: wandb.finish()
-
-
-def main() -> None:
-    train(utils.parse_cfg(DEFAULT_CFG))
+    if cfg.log.save_model and jax.process_index() == 0:
+        models.save(model, run_dir / "final_model")
+    if jax.process_index() == 0:
+        wandb.finish()
 
 
 if __name__ == "__main__":
-    main()
+    train(utils.parse_cfg(DEFAULT_CFG))
