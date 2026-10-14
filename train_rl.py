@@ -163,10 +163,12 @@ def train(cfg):
         stats = {"mean_completion_len": lengths.mean(), "frac_truncated": truncated.mean()}
         return batch, vocab, rollout.score(env.rubric, rows, texts, group_size), stats
 
-    def evaluate(key=jax.random.fold_in(key, 3)):  # the same eval prompts and key every time
+    eval_key = jax.random.fold_in(key, 3)  # the same eval prompts and key every time
+
+    def evaluate():
         weights = copy_to_sampler(jax.block_until_ready(model.weights))
         return np.mean([
-            sample(eval_rows[i:i + num_prompts], weights, jax.random.fold_in(key, i), eval_forward)[2]
+            sample(eval_rows[i:i + num_prompts], weights, jax.random.fold_in(eval_key, i), eval_forward)[2]
             for i in range(0, len(eval_rows), num_prompts)])
 
     @partial(jax.jit, donate_argnums=(0, 1))
