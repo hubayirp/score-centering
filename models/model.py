@@ -1,5 +1,4 @@
 import json
-import math
 from collections import defaultdict
 from dataclasses import dataclass
 from functools import partial
@@ -11,8 +10,6 @@ import jax.numpy as jnp
 import numpy as np
 from huggingface_hub import snapshot_download
 from jax.sharding import AxisType, PartitionSpec as P, reshard
-
-from models import quant
 from safetensors import safe_open
 from safetensors.numpy import save_file
 from transformers import AutoTokenizer
@@ -23,14 +20,12 @@ from models.quant import qeinsum
 
 @dataclass
 class Model:
-    source: str
     weights: dict[str, Any]
     forward: Callable
     head: Callable
     init_kv: Callable
     tokenizer: Any
     config: dict[str, Any]
-    save: Callable
 
 
 def apply_rope(x, cfg, pos=0):
@@ -217,62 +212,40 @@ def _head_dim(cfg):
     return cfg.get("head_dim", cfg["hidden_size"] // cfg["num_attention_heads"])
 
 
-def _load_template(model_id, hf_ckpt_dir, allow_patterns=None):
-    source = Path(model_id).expanduser()
-    if not source.exists():
-        source = Path(hf_ckpt_dir).expanduser() / model_id
-        snapshot_download(repo_id=model_id, local_dir=source, allow_patterns=allow_patterns)
-    cfg = json.loads((source / "config.json").read_text())
-    if cfg.get("model_type") not in ("llama", "qwen2", "qwen3", "qwen3_moe"):
-        raise ValueError(f"Only Llama/Qwen2/Qwen3 checkpoints are supported, got model_type={cfg.get('model_type')}")
-    if cfg.get("use_sliding_window"):
-        raise ValueError("sliding-window attention is not implemented (attention here is always full)")
-    if (rs := cfg.get("rope_scaling")) and rs.get("rope_type") != "llama3":
-        raise ValueError(f"only llama3-type rope_scaling is supported, got {rs}")
-    tokenizer = AutoTokenizer.from_pretrained(source)
+def _download(source, weights_dir):
+    path = Path(source).expanduser()
+    if not path.exists():
+        path = Path(weights_dir).expanduser() / source
+        snapshot_download(repo_id=source, local_dir=path)
+    cfg = json.loads((path / "config.json").read_text())
+    assert cfg["model_type"] in ("llama", "qwen2", "qwen3", "qwen3_moe"), cfg["model_type"]
+    assert not cfg.get("use_sliding_window"), "sliding-window attention is not implemented"
+    assert cfg.get("rope_scaling") is None or cfg["rope_scaling"]["rope_type"] == "llama3"
+    tokenizer = AutoTokenizer.from_pretrained(path)
     if tokenizer.pad_token is None:  # llama ships no pad token; 3.1+ reserves this id
         tokenizer.pad_token = "<|finetune_right_pad_id|>"
-    return source, tokenizer, cfg
+    return path, tokenizer, cfg
 
 
-def _make_random_cfg(template_cfg, hidden_size=None, num_hidden_layers=None):
-    hidden_size = template_cfg["hidden_size"] if hidden_size is None else int(hidden_size)
-    num_hidden_layers = template_cfg["num_hidden_layers"] if num_hidden_layers is None else int(num_hidden_layers)
-    if hidden_size < 128 or hidden_size % 128 != 0:
-        raise ValueError(f"hidden_size must be a positive multiple of 128, got {hidden_size}")
-    if num_hidden_layers < 1:
-        raise ValueError(f"num_hidden_layers must be >= 1, got {num_hidden_layers}")
-
-    cfg = dict(template_cfg)
-    cfg["hidden_size"] = hidden_size
-    cfg["num_hidden_layers"] = num_hidden_layers
-    cfg["num_attention_heads"] = hidden_size // 128
-    cfg["num_key_value_heads"] = math.gcd(cfg["num_attention_heads"], 8)
-    cfg["intermediate_size"] = 3 * hidden_size
-    if "max_window_layers" in cfg: cfg["max_window_layers"] = min(cfg["max_window_layers"], num_hidden_layers)
-    if "layer_types" in cfg: cfg["layer_types"] = ["full_attention"] * num_hidden_layers
-    return cfg
-
-
-def _get_sharding(key, dp_shard=False):
+def _get_sharding(key, fsdp=False):
     """Per-layer weights are stacked [L, ...]: their specs gain a leading None."""
     if "norm" in key or "bias" in key or key.endswith("mlp.gate.weight"): return P()
     if "experts" in key:  # stacked (E, D, F) gate/up and (E, F, D) down: always fully expert-parallel
         spec = P(("data", "model"), None, None)
     elif any(k in key for k in ("q_proj", "k_proj", "v_proj")):
-        spec = P("model", None, "data") if dp_shard else P("model", None, None)
+        spec = P("model", None, "data") if fsdp else P("model", None, None)
     elif "o_proj" in key:
-        spec = P("data", "model", None) if dp_shard else P(None, "model", None)
+        spec = P("data", "model", None) if fsdp else P(None, "model", None)
     elif any(k in key for k in ("gate_proj", "up_proj", "embed_tokens", "lm_head")):
-        spec = P("model", "data") if dp_shard else P("model")
+        spec = P("model", "data") if fsdp else P("model")
     elif "down_proj" in key:
-        spec = P("data", "model") if dp_shard else P(None, "model")
+        spec = P("data", "model") if fsdp else P(None, "model")
     else:
         raise ValueError(f"Unrecognized key: {key}")
     return P(None, *spec) if key.startswith("model.layers.") else spec
 
 
-def _load_weights(model_ckpt_dir, cfg, dp_shard=False):
+def _load_weights(model_ckpt_dir, cfg, fsdp=False):
     N, K, D, H = cfg["num_attention_heads"], cfg["num_key_value_heads"], cfg["hidden_size"], _head_dim(cfg)
     weights, experts, layered = {}, defaultdict(dict), defaultdict(dict)
 
@@ -281,7 +254,7 @@ def _load_weights(model_ckpt_dir, cfg, dp_shard=False):
             index, _, name = key.removeprefix("model.layers.").partition(".")
             layered[f"model.layers.{name}"][int(index)] = value
         else:
-            weights[key] = jax.device_put(value, _get_sharding(key, dp_shard))
+            weights[key] = jax.device_put(value, _get_sharding(key, fsdp))
 
     for file in sorted(model_ckpt_dir.glob("*.safetensors")):
         with safe_open(file, framework="numpy") as f:
@@ -302,102 +275,26 @@ def _load_weights(model_ckpt_dir, cfg, dp_shard=False):
         add(key, np.stack([parts[e] for e in range(cfg["num_experts"])]).swapaxes(1, 2))
     for key, parts in layered.items():
         value = np.stack([parts[i] for i in range(cfg["num_hidden_layers"])])
-        weights[key] = jax.device_put(value, _get_sharding(key, dp_shard))
+        weights[key] = jax.device_put(value, _get_sharding(key, fsdp))
     if not weights:
         raise ValueError(f"No safetensors files found in {model_ckpt_dir}")
     return weights
 
 
-def _random_weights(cfg, key, dp_shard=False):
-    std = cfg["initializer_range"]
-    D, F, N, K, H, V = cfg["hidden_size"], cfg.get("intermediate_size"), cfg["num_attention_heads"], cfg["num_key_value_heads"], _head_dim(cfg), cfg["vocab_size"]
-    weights = {}
-
-    def add(name, shape, ones=False):
-        nonlocal key
-        if ones:
-            value = jnp.ones(shape, dtype=jnp.bfloat16)
-        else:
-            key, subkey = jax.random.split(key)
-            value = (jax.random.normal(subkey, shape, dtype=jnp.float32) * std).astype(jnp.bfloat16)
-        weights[name] = jax.device_put(value, _get_sharding(name, dp_shard))
-
-    add("model.embed_tokens.weight", (V, D))
-    add("model.norm.weight", (D,), ones=True)
-    if not cfg["tie_word_embeddings"]: add("lm_head.weight", (V, D))
-
-    specs = [
-        ("input_layernorm.weight", (D,), True),
-        ("post_attention_layernorm.weight", (D,), True),
-        ("self_attn.q_proj.weight", (N, H, D), False),
-        ("self_attn.k_proj.weight", (K, H, D), False),
-        ("self_attn.v_proj.weight", (K, H, D), False),
-        ("self_attn.o_proj.weight", (D, N, H), False),
-    ]
-    if cfg["model_type"] in ("qwen3", "qwen3_moe"):  # llama/qwen2 have no q/k norm
-        specs += [("self_attn.q_norm.weight", (H,), True), ("self_attn.k_norm.weight", (H,), True)]
-    if "num_experts" in cfg:
-        E, Fm = cfg["num_experts"], cfg["moe_intermediate_size"]
-        specs += [
-            ("mlp.gate.weight", (E, D), False),
-            ("mlp.experts.gate_proj.weight", (E, D, Fm), False),
-            ("mlp.experts.up_proj.weight", (E, D, Fm), False),
-            ("mlp.experts.down_proj.weight", (E, Fm, D), False),
-        ]
-    else:
-        specs += [
-            ("mlp.gate_proj.weight", (F, D), False),
-            ("mlp.up_proj.weight", (F, D), False),
-            ("mlp.down_proj.weight", (D, F), False),
-        ]
-    for name, shape, ones in specs:  # per-layer weights are stacked [L, ...]
-        add("model.layers." + name, (cfg["num_hidden_layers"], *shape), ones)
-    return weights
-
-
-def load(model_id="Qwen/Qwen3-0.6B-Base", hf_ckpt_dir="~/.cache/postax/weights", tp_size=1, dp_shard=False, init="pretrained", hidden_size=None, num_hidden_layers=None, key=None):
-    if jax.device_count() % tp_size != 0:
-        raise ValueError(f"tp_size={tp_size} does not divide device_count={jax.device_count()}")
-    mesh = jax.make_mesh((jax.device_count() // tp_size, tp_size), ("data", "model"), axis_types=(AxisType.Explicit, AxisType.Explicit))
-    jax.set_mesh(mesh)
-    has_architecture_override = hidden_size is not None or num_hidden_layers is not None
-
-    if init == "pretrained":
-        if has_architecture_override:
-            raise ValueError("hidden_size and num_hidden_layers overrides are only supported when init='random'")
-        model_ckpt_dir, tokenizer, cfg = _load_template(model_id, hf_ckpt_dir)
-        return Model(
-            source=str(model_id),
-            weights=_load_weights(model_ckpt_dir, cfg, dp_shard),
-            forward=partial(forward, cfg),
-            head=partial(head, cfg),
-            init_kv=partial(
-                init_kv, cfg["num_hidden_layers"],
-                cfg["num_key_value_heads"], _head_dim(cfg)),
-            tokenizer=tokenizer,
-            config=cfg,
-            save=save,
-        )
-
-    if init == "random":
-        if key is None:
-            raise ValueError("Random initialization requires a JAX PRNG key")
-        _, tokenizer, template_cfg = _load_template(model_id, hf_ckpt_dir, ["*.json", "*.txt", "*.jinja"])
-        cfg = _make_random_cfg(template_cfg, hidden_size=hidden_size, num_hidden_layers=num_hidden_layers)
-        return Model(
-            source=str(model_id),
-            weights=_random_weights(cfg, key, dp_shard),
-            forward=partial(forward, cfg),
-            head=partial(head, cfg),
-            init_kv=partial(
-                init_kv, cfg["num_hidden_layers"],
-                cfg["num_key_value_heads"], _head_dim(cfg)),
-            tokenizer=tokenizer,
-            config=cfg,
-            save=save,
-        )
-
-    raise ValueError(f"Unknown init mode: {init}")
+def load(source, weights_dir="~/.cache/postax/weights", tp=1, fsdp=True):
+    """Load a Llama / Qwen2 / Qwen3 / Qwen3-MoE checkpoint (local path or HF hub
+    id) onto a (data, model) mesh: tp-way tensor parallel, FSDP over data."""
+    jax.set_mesh(jax.make_mesh((jax.device_count() // tp, tp), ("data", "model"),
+                               axis_types=(AxisType.Explicit, AxisType.Explicit)))
+    path, tokenizer, cfg = _download(source, weights_dir)
+    return Model(
+        weights=_load_weights(path, cfg, fsdp),
+        forward=partial(forward, cfg),
+        head=partial(head, cfg),
+        init_kv=partial(init_kv, cfg["num_hidden_layers"], cfg["num_key_value_heads"], _head_dim(cfg)),
+        tokenizer=tokenizer,
+        config=cfg,
+    )
 
 
 def save(model, output_dir):

@@ -1,4 +1,4 @@
-"""Fixed-batch autoregressive token sampling."""
+"""Fixed-batch autoregressive sampling with a KV cache."""
 from functools import partial
 from typing import NamedTuple
 
@@ -101,22 +101,14 @@ def _generate(key, forward, init_kv, weights, tokens,
             head_logprobs, head_ids)
 
 
-def generate(key, model, tokens, prompt_lengths, *, weights=None, forward=None,
-             init_kv=None, eos_id=None, logprobs_dtype=None, logprobs_topk=0):
-    """Fill one fixed token batch and record the distributions used.
-
-    logprobs_dtype keeps the full [B, T, V] distribution; logprobs_topk
-    keeps only the per-step top-k head (ids + logprobs) instead — same
-    information score centering consumes, at ~V/k the memory.
-    """
-    weights = model.weights if weights is None else weights
-    forward = model.forward if forward is None else forward
-    init_kv = model.init_kv if init_kv is None else init_kv
-    eos_id = model.tokenizer.eos_token_id if eos_id is None else eos_id
-    eos_id = -1 if eos_id is None else eos_id
-    key = reshard(key, P())
-    prompt_lengths = reshard(jnp.asarray(prompt_lengths, jnp.int32), P("data"))
+def generate(key, model, weights, forward, init_kv, tokens, prompt_lengths,
+             logprobs_dtype=None, logprobs_topk=0):
+    """Fill a fixed token batch after each row's prompt and record the sampling
+    distribution: per-token logprobs always, plus either the full [B, T, V]
+    logprobs (logprobs_dtype) or the per-step top-k head (logprobs_topk), which
+    is what score centering consumes at ~V/k the memory."""
     return _generate(
-        key, forward, init_kv, weights, tokens,
-        prompt_lengths, eos_id, model.config["vocab_size"], logprobs_dtype,
-        logprobs_topk)
+        reshard(key, P()), forward, init_kv, weights, tokens,
+        reshard(jnp.asarray(prompt_lengths, jnp.int32), P("data")),
+        model.tokenizer.eos_token_id, model.config["vocab_size"],
+        logprobs_dtype, logprobs_topk)
