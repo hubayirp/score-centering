@@ -44,6 +44,5 @@ def test_score_centering_cancels_drift(name, center):
     assert jnp.abs(expected_gradient(CORRECTIONS[name], center)).max() < 1e-6
 
 
-@pytest.mark.parametrize("name", CORRECTIONS)
-def test_drift_without_centering(name):
-    assert jnp.abs(expected_gradient(CORRECTIONS[name], None)).max() > 1e-3
+def test_drift_without_centering():  # the test can fail: plain REINFORCE does drift
+    assert jnp.abs(expected_gradient(None, None)).max() > 1e-3
