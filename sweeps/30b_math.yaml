@@ -17,7 +17,7 @@ command:
   rl.seq_len=1024 eval.num_prompts=128 eval.every_steps=50
   stop.steps=800 stop.collapse=0
   opt.optimizer=sgd opt.lr=0.01 sampler.shard.tp=4
-  sampler.weight_quant=null sampler.staleness=0
+  sampler.staleness=0
   ${0#*=} ${1#*=}
 - ${args_no_hyphens}
 parameters:

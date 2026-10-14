@@ -66,7 +66,7 @@ parameters:
       env.args={strict:true,solve_rate_field:solve_rate_qwen_r1_distill_7b,min_solve_rate:0.125,max_solve_rate:0.875}
       rl.num_prompts=16 rl.seq_len=1024
       eval.num_prompts=128 eval.every_steps=50 stop.steps=800
-      sampler.shard.tp=4 sampler.weight_quant=null sampler.staleness=0
+      sampler.shard.tp=4 sampler.staleness=0
       sampler.weight_noise_scale=0 dtypes.sampler=float8_e4m3fn
       sampler.kv_quant_bits=fp8 rl.is.level=null rl.sc=true
       log.run_name=topk-30b-fp8kv8-k${sampler.vocab_logprobs}-seed${run.seed}
@@ -75,7 +75,7 @@ parameters:
       env.args={strict:true,solve_rate_field:solve_rate_qwen_r1_distill_7b,min_solve_rate:0.125,max_solve_rate:0.875}
       rl.num_prompts=16 rl.seq_len=1024
       eval.num_prompts=128 eval.every_steps=50 stop.steps=800
-      sampler.shard.tp=4 sampler.weight_quant=null sampler.staleness=0
+      sampler.shard.tp=4 sampler.staleness=0
       sampler.weight_noise_scale=0 dtypes.sampler=float8_e4m3fn
       sampler.kv_quant_bits=fp4 rl.is.level=null rl.sc=true
       log.run_name=topk-30b-fp8kv4-k${sampler.vocab_logprobs}-seed${run.seed}
@@ -84,7 +84,7 @@ parameters:
       env.args={strict:true,solve_rate_field:solve_rate_qwen_r1_distill_7b,min_solve_rate:0.125,max_solve_rate:0.875}
       rl.num_prompts=16 rl.seq_len=1024
       eval.num_prompts=128 eval.every_steps=50 stop.steps=800
-      sampler.shard.tp=4 sampler.weight_quant=null sampler.staleness=0
+      sampler.shard.tp=4 sampler.staleness=0
       sampler.weight_noise_scale=0 dtypes.sampler=int8
       sampler.kv_quant_bits=4 rl.is.level=null rl.sc=true
       log.run_name=topk-30b-int8kv4-k${sampler.vocab_logprobs}-seed${run.seed}
