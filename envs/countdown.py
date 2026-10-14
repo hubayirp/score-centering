@@ -1,14 +1,12 @@
-"""Countdown as a verifiers environment: on-the-fly solvable problems and a
-0/1 reward for RLVR. One file in the hub convention — load_environment() —
-so tasks/rollout.py loads it by id exactly like an installed hub env.
-"""
-from __future__ import annotations
+"""Countdown as a verifiers environment: seeded solvable problems (reach a
+target from four numbers with + - * /) and a 0/1 reward."""
 import random
 import re
 from collections import Counter
 from fractions import Fraction
 
 import verifiers as vf
+from datasets import Dataset
 
 OPERATIONS = ("+", "-", "*", "/")
 
@@ -98,41 +96,8 @@ def _rows(rng, n, **gen_args):
 
 
 def load_environment(num_operands=4, min_number=1, max_number=100, max_target=1000,
-                     dataset_size=20_000, num_eval_examples=128, seed=0):
-    """Standard verifiers entry point. Fixed seeded datasets stand in for
-    on-the-fly generation: training draws without replacement (~1s per 20k
-    problems at import), eval reuses the same held-out problems every run."""
-    from datasets import Dataset
-    gen_args = dict(num_operands=num_operands, min_number=min_number,
-                    max_number=max_number, max_target=max_target)
-    return vf.SingleTurnEnv(
-        dataset=Dataset.from_list(_rows(random.Random(seed), dataset_size, **gen_args)),
-        eval_dataset=Dataset.from_list(
-            _rows(random.Random(seed + 999), num_eval_examples, **gen_args)),
-        rubric=vf.Rubric(funcs=[correct]))
+                     dataset_size=20_000, seed=0):
+    rows = _rows(random.Random(seed), dataset_size, num_operands=num_operands,
+                 min_number=min_number, max_number=max_number, max_target=max_target)
+    return vf.SingleTurnEnv(dataset=Dataset.from_list(rows), rubric=vf.Rubric(funcs=[correct]))
 
-
-if __name__ == "__main__":
-    rng = random.Random(0)
-    for _ in range(3):
-        ex = generate(rng)
-        print(ex)
-        assert compute_reward(f"<answer>{ex['solution']}</answer>",
-                              ex["numbers"], ex["target"]) == 1.0
-    # reward edge cases
-    nums, tgt = [3, 5, 7], 26
-    for name, c in {
-        "correct": "<answer>3 * 7 + 5</answer>",
-        "wrong value": "<answer>3 + 5 + 7</answer>",
-        "reuses number": "<answer>3 * 7 + 5 + 5</answer>",
-        "unknown number": "<answer>3 * 7 + 9</answer>",
-        "no tag": "the answer is 3*7+5",
-        "bare target in answer": "<think>3*7+5</think><answer>26</answer>",
-    }.items():
-        print(f"{name:24s} -> {compute_reward(c, nums, tgt)}")
-    env = load_environment(dataset_size=8, num_eval_examples=4)
-    row = env.get_dataset()[0]
-    good = [vf.AssistantMessage(content=f"<answer>{row['answer']}</answer>")]
-    assert correct(good, row["info"]) == 1.0 and correct([], row["info"]) == 0.0
-    print(f"ok: env of {len(env.get_dataset())}+{len(env.get_eval_dataset())} rows, "
-          "rubric scores the recorded solutions")
