@@ -13,7 +13,7 @@ command:
   model.source=Qwen/Qwen3-30B-A3B-Base "model.weights_dir=${POSTAX_WEIGHTS_DIR:-$HOME/.cache/postax/weights}"
   log.project=score-centering run.seed=${POSTAX_SEED:-0}
   env.id=intellect-math env.prompt_format=text
-  'env.args={strict:true,solve_rate_field:solve_rate_qwen_r1_distill_7b,min_solve_rate:0.125,max_solve_rate:0.875}'
+  env.args.strict=true env.args.solve_rate_field=solve_rate_qwen_r1_distill_7b env.args.min_solve_rate=0.125 env.args.max_solve_rate=0.875
   rl.seq_len=1024 eval.num_prompts=128 eval.every_steps=50
   stop.steps=800 stop.collapse=0
   opt.optimizer=sgd opt.lr=0.01 sampler.shard.tp=4
