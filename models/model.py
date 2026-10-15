@@ -202,11 +202,11 @@ def _head_dim(cfg):
     return cfg.get("head_dim", cfg["hidden_size"] // cfg["num_attention_heads"])
 
 
-def _download(source, weights_dir):
+def _download(source, weights_dir, weights=True):
     path = Path(source).expanduser()
     if not path.exists():
         path = Path(weights_dir).expanduser() / source
-        snapshot_download(repo_id=source, local_dir=path)
+        snapshot_download(repo_id=source, local_dir=path, allow_patterns=None if weights else ["*.json", "*.jinja"])
     cfg = json.loads((path / "config.json").read_text())
     assert cfg["model_type"] in ("llama", "qwen2", "qwen3", "qwen3_moe"), cfg["model_type"]
     assert not cfg.get("use_sliding_window"), "sliding-window attention is not implemented"
@@ -272,13 +272,52 @@ def _load_weights(model_ckpt_dir, cfg, fsdp=False):
     return weights
 
 
-def load(source, weights_dir="~/.cache/postax/weights", tp=1, fsdp=True):
+def _random_weights(cfg, key, fsdp=False):
+    """N(0, initializer_range) matrices, unit norms and zero biases, laid out as _load_weights lays them out."""
+    D, N, K, H = cfg["hidden_size"], cfg["num_attention_heads"], cfg["num_key_value_heads"], _head_dim(cfg)
+    layer = {"input_layernorm.weight": (D,), "post_attention_layernorm.weight": (D,),
+             "self_attn.q_proj.weight": (N, H, D), "self_attn.k_proj.weight": (K, H, D),
+             "self_attn.v_proj.weight": (K, H, D), "self_attn.o_proj.weight": (D, N, H)}
+    if cfg["model_type"] == "qwen2" or cfg.get("attention_bias"):
+        layer |= {"self_attn.q_proj.bias": (N, H), "self_attn.k_proj.bias": (K, H), "self_attn.v_proj.bias": (K, H)}
+    if cfg["model_type"] in ("qwen3", "qwen3_moe"):
+        layer |= {"self_attn.q_norm.weight": (H,), "self_attn.k_norm.weight": (H,)}
+    if "num_experts" in cfg:
+        E, F = cfg["num_experts"], cfg["moe_intermediate_size"]
+        layer |= {"mlp.gate.weight": (E, D), "mlp.experts.gate_proj.weight": (E, D, F),
+                  "mlp.experts.up_proj.weight": (E, D, F), "mlp.experts.down_proj.weight": (E, F, D)}
+    else:
+        F = cfg["intermediate_size"]
+        layer |= {"mlp.gate_proj.weight": (F, D), "mlp.up_proj.weight": (F, D), "mlp.down_proj.weight": (D, F)}
+    shapes = {"model.embed_tokens.weight": (cfg["vocab_size"], D), "model.norm.weight": (D,)}
+    if not cfg.get("tie_word_embeddings"):
+        shapes["lm_head.weight"] = (cfg["vocab_size"], D)
+    shapes |= {f"model.layers.{name}": (cfg["num_hidden_layers"], *shape) for name, shape in layer.items()}
+
+    def init(name, shape, key):
+        spec = _get_sharding(name, fsdp)
+        if "norm" in name or "bias" in name:
+            return (jnp.ones if "norm" in name else jnp.zeros)(shape, jnp.bfloat16, out_sharding=spec)
+        return (cfg["initializer_range"] * jax.random.normal(key, shape, out_sharding=spec)).astype(jnp.bfloat16)
+
+    keys = jax.random.split(key, len(shapes))
+    return {name: init(name, shape, k) for (name, shape), k in zip(shapes.items(), keys)}
+
+
+def load(source, weights_dir="~/.cache/postax/weights", tp=1, fsdp=True, init="pretrained", overrides=None, seed=0):
     """Load a Llama / Qwen2 / Qwen3 / Qwen3-MoE checkpoint (local path or HF hub
-    id) onto a (data, model) mesh: tp-way tensor parallel, FSDP over data."""
+    id) onto a (data, model) mesh: tp-way tensor parallel, FSDP over data.
+    init="random" takes only the config (plus any overrides) and tokenizer from source."""
+    assert init in ("pretrained", "random") and (init == "random" or not overrides), (init, overrides)
     jax.set_mesh(jax.make_mesh((jax.device_count() // tp, tp), ("data", "model"),
                                axis_types=(AxisType.Explicit, AxisType.Explicit)))
-    path, tokenizer, cfg = _download(source, weights_dir)
-    return Model(weights=_load_weights(path, cfg, fsdp), forward=partial(forward, cfg), head=partial(head, cfg),
+    path, tokenizer, cfg = _download(source, weights_dir, weights=init == "pretrained")
+    if init == "random":  # drop layer_types: HF derives it from num_hidden_layers when the model is reloaded
+        cfg = {k: v for k, v in cfg.items() if k != "layer_types"} | dict(overrides or {})
+        weights = _random_weights(cfg, jax.random.key(seed), fsdp)
+    else:
+        weights = _load_weights(path, cfg, fsdp)
+    return Model(weights=weights, forward=partial(forward, cfg), head=partial(head, cfg),
                  init_kv=partial(init_kv, cfg["num_hidden_layers"], cfg["num_key_value_heads"], _head_dim(cfg)),
                  tokenizer=tokenizer, config=cfg)
 

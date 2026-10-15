@@ -123,7 +123,7 @@ With the top-k sampler head (`sampler.vocab_logprobs=k`), the sampler's tail is 
 
 Score centering was developed in **postax**, a JAX framework I built for LLM full-stack research. This repo includes a slimmed-down version of the framework, with features beyond score centering:
 
-- SFT, DPO, RL
+- Pretraining and SFT (`train_lm.py`), DPO (`train_dpo.py`), RL (`train_rl.py`)
 - Llama 3–3.3, Qwen2, Qwen3, Qwen3-MoE (load + save HF checkpoint)
 - TP, DP, FSDP, EP
 
@@ -138,7 +138,7 @@ python train_rl.py model.source=Qwen/Qwen3-0.6B env.id=countdown \
   rl.sc=true rl.is.level=token rl.is.high=2.0 rl.is.outside=clamp
 ```
 
-Use `log.wandb_mode=disabled` to run without W&B. Models are cached in `~/.cache/postax/weights`, and configs and metrics go to `outputs/`. SFT and DPO use `train_lm.py` and `train_dpo.py`.
+Use `log.wandb_mode=disabled` to run without W&B. Models are cached in `~/.cache/postax/weights`, and configs and metrics go to `outputs/`.
 
 ## Paper sweeps
 

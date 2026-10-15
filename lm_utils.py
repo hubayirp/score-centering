@@ -1,5 +1,6 @@
 """Data and logprob helpers for train_lm.py and train_dpo.py."""
 import functools
+import itertools
 
 import datasets
 import jax
@@ -66,11 +67,19 @@ def _pad(tokens, mask, seq_len):
     return {"tokens": padded[0], "mask": padded[1]}
 
 
+def pack(texts, tokenizer, seq_len):
+    """Documents, each followed by EOS, concatenated and cut into full rows (attention crosses documents)."""
+    buffer = []
+    for chunk in itertools.batched(texts, 256):  # batched tokenization is much faster
+        for ids in tokenizer(list(chunk))["input_ids"]:
+            buffer += ids + [tokenizer.eos_token_id]
+        while len(buffer) >= seq_len:
+            yield {"tokens": np.array(buffer[:seq_len], np.int32), "mask": np.ones(seq_len, bool)}
+            buffer = buffer[seq_len:]
+
+
 def encode(row, tokenizer, seq_len, format):
-    """One dataset row -> padded arrays, or None to skip (too long / empty)."""
-    if format == "text":
-        tokens = tokenizer.encode(row["text"])
-        return _pad(tokens, np.ones(len(tokens), bool), seq_len)
+    """One chat or preference row -> padded arrays, or None to skip (too long / empty)."""
     if format == "chat":
         if any(m["content"] is None for m in row["messages"]):
             return None
@@ -85,19 +94,24 @@ def encode(row, tokenizer, seq_len, format):
 
 
 def load_batches(data, tokenizer, seed):
-    """HF dataset -> (make_train(epoch) batch iterator, list of valid batches).
-    The first data.valid_rows rows of a seeded shuffle are held out."""
-    ds = datasets.load_dataset(data.path, data.name, split=data.split).shuffle(seed=seed)
-    valid, train = ds.select(range(data.valid_rows)), ds.select(range(data.valid_rows, len(ds)))
+    """HF dataset -> (make_train(epoch) batch iterator, list of valid batches, steps per epoch).
+    format=text packs documents into full rows; chat and preference rows are padded, and skipped
+    if longer than seq_len. The first data.valid_rows rows (of a seeded shuffle, unless streaming)
+    are held out. Steps per epoch is None if unknown (text or streaming), else an upper bound."""
+    ds = datasets.load_dataset(data.path, data.name, split=data.split, streaming=data.streaming)
+    ds = ds if data.streaming else ds.shuffle(seed=seed)
+    valid, train = ds.take(data.valid_rows), ds.skip(data.valid_rows)
 
     def batches(rows):
-        batch = []
-        for row in rows:
-            example = encode(row, tokenizer, data.seq_len, data.format)
-            if example is not None:
-                batch.append(example)
+        if data.format == "text":
+            examples = pack((row["text"] for row in rows), tokenizer, data.seq_len)
+        else:
+            examples = filter(None, (encode(row, tokenizer, data.seq_len, data.format) for row in rows))
+        for batch in itertools.batched(examples, data.batch_size):
             if len(batch) == data.batch_size:
                 yield {k: np.stack([ex[k] for ex in batch]) for k in batch[0]}
-                batch = []
 
-    return (lambda epoch: batches(train.shuffle(seed=seed + epoch))), list(batches(valid))
+    shuffle = {"buffer_size": 10_000} if data.streaming else {}
+    make_train = lambda epoch: batches(train.shuffle(seed=seed + epoch, **shuffle))
+    steps_per_epoch = None if data.streaming or data.format == "text" else len(train) // data.batch_size
+    return make_train, list(batches(valid)), steps_per_epoch

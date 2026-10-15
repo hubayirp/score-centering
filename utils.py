@@ -18,8 +18,14 @@ def parse_cfg(default_cfg):
     return cfg
 
 
-def make_optimizer(name, lr):
-    return {"sgd": optax.sgd, "adamw": optax.adamw}[name](lr)
+def make_optimizer(name, lr, b2=0.999, weight_decay=1e-4, warmup_steps=0, decay_steps=0):
+    """SGD or AdamW. Linear warmup from 0, then a constant LR, or with decay_steps a cosine decay to 0 at that step."""
+    assert name in ("sgd", "adamw"), name
+    if decay_steps:
+        lr = optax.warmup_cosine_decay_schedule(0.0, lr, warmup_steps, decay_steps)
+    elif warmup_steps:
+        lr = optax.linear_schedule(0.0, lr, warmup_steps)
+    return optax.sgd(lr) if name == "sgd" else optax.adamw(lr, b2=b2, weight_decay=weight_decay)
 
 
 def start_run(cfg):

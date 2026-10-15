@@ -23,6 +23,7 @@ data:
   path: allenai/olmo-2-0425-1b-preference-mix
   name: null
   split: train
+  streaming: false
   format: preference
   seq_len: 2048
   batch_size: 16
@@ -34,8 +35,12 @@ dpo:
   margin: 0.0
   sft_weight: 0.0  # add this times the NTP loss on chosen responses
 opt:
-  optimizer: adamw
+  optimizer: adamw  # adamw | sgd
   lr: 1e-6
+  b2: 0.997
+  weight_decay: 0.02
+  warmup_steps: 0
+  cosine: false  # decay the LR to 0 over the run
   epochs: 1
 log:
   project: postax-dpo
@@ -54,8 +59,11 @@ def train(cfg):
     model = models.load(cfg.model.source, cfg.model.weights_dir, tp=cfg.model.tp)
     ref_weights = jax.tree.map(lambda w: w.astype(jnp.bfloat16), model.weights)  # frozen
     model.weights = jax.tree.map(lambda w: w.astype(jnp.float32), model.weights)
-    make_train, valid_batches = lm_utils.load_batches(cfg.data, model.tokenizer, cfg.run.seed)
-    optimizer = utils.make_optimizer(cfg.opt.optimizer, cfg.opt.lr)
+    make_train, valid_batches, steps_per_epoch = lm_utils.load_batches(cfg.data, model.tokenizer, cfg.run.seed)
+    steps = cfg.opt.epochs * steps_per_epoch if steps_per_epoch else None
+    assert steps or not cfg.opt.cosine, "opt.cosine needs the run length, unknown when streaming"
+    optimizer = utils.make_optimizer(cfg.opt.optimizer, cfg.opt.lr, b2=cfg.opt.b2, weight_decay=cfg.opt.weight_decay,
+                                     warmup_steps=cfg.opt.warmup_steps, decay_steps=steps if cfg.opt.cosine else 0)
     opt_state = optimizer.init(model.weights)
     run_dir = utils.start_run(cfg)
 
