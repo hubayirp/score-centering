@@ -127,7 +127,7 @@ def loss_fn_rl(hidden, head, batch, correction=None, score_center=False, chunk=1
     sampler_keys = ("sampling_token_logprobs", "sampling_vocab_logprobs", "center_ids", "center_logprobs")
     per_token = {"hidden": hidden, "targets": targets, "mask": mask} | {k: batch[k] for k in sampler_keys if k in batch}
 
-    def chunk_sums(sums, start):
+    def chunk_sums(start):
         b = {k: jax.lax.dynamic_slice_in_dim(v, start, chunk, axis=1) for k, v in per_token.items()}
         logp_vocab = jax.nn.log_softmax(head(b["hidden"]).astype(jnp.float32))
         logp = take_vocab(logp_vocab, b["targets"][..., None])[..., 0]
@@ -151,12 +151,10 @@ def loss_fn_rl(hidden, head, batch, correction=None, score_center=False, chunk=1
                 mass = jnp.exp(log_mass(logp_head, logq_head, positive[..., None], token_c))
                 residual = mass - alpha[..., None] * p_head
                 terms["score"] -= (sg(residual) * logp_head).sum(-1) + sg(alpha * plogp)
-        return {k: s + (terms[k] * b["mask"]).sum(-1) for k, s in sums.items()}, None
+        return {k: (v * b["mask"]).sum(-1) for k, v in terms.items()}
 
-    keys = ["score", "entropy", "kl_samp_train", "masked", "tv"]
-    keys += ["kl_head"] if "center_ids" in batch else []
-    zeros = jnp.zeros_like(batch["advantages"], dtype=jnp.float32)  # per-sequence sums
-    sums, _ = jax.lax.scan(jax.checkpoint(chunk_sums), dict.fromkeys(keys, zeros), jnp.arange(0, seq_len, chunk))
+    chunks = jax.lax.map(jax.checkpoint(chunk_sums), jnp.arange(0, seq_len, chunk))
+    sums = {k: v.sum(0) for k, v in chunks.items()}  # per-sequence sums [B]
 
     n_tokens = jnp.maximum(mask.sum(), 1)
     advantages = batch["advantages"]
