@@ -296,7 +296,7 @@ def save(model, output_dir):
             if ".mlp.experts." in k:  # unstack (E, in, out) back to per-expert HF (out, in)
                 layer, _, proj = k.partition(".mlp.experts.")
                 for e in range(v.shape[0]):
-                    hf[f"{layer}.mlp.experts.{e}.{proj}"] = v[e].T
+                    hf[f"{layer}.mlp.experts.{e}.{proj}"] = np.ascontiguousarray(v[e].T)  # safetensors ignores strides
                 continue
             if "q_proj" in k or "k_proj" in k or "v_proj" in k: v = v.reshape(-1, v.shape[-1]) if v.ndim == 3 else v.reshape(-1)
             if "o_proj.weight" in k: v = v.reshape(v.shape[0], -1)
