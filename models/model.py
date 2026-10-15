@@ -102,12 +102,9 @@ def attention(q, k, v, mask=None, *, is_causal=False):
     # locally so JAX's internal GQA reshape need not infer explicit sharding.
     # This also leaves the causal cuDNN path available on GPUs.
     heads = P("data", None, "model", None)
-    return jax.shard_map(
-        lambda q, k, v, mask: jax.nn.dot_product_attention(
-            q, k, v, mask=mask, is_causal=is_causal),
-        in_specs=(heads, heads, heads, P("data", None, None, None) if mask is not None else None),
-        out_specs=heads,
-    )(q, k, v, mask)
+    attend = lambda q, k, v, mask: jax.nn.dot_product_attention(q, k, v, mask=mask, is_causal=is_causal)
+    mask_spec = P("data", None, None, None) if mask is not None else None
+    return jax.shard_map(attend, in_specs=(heads, heads, heads, mask_spec), out_specs=heads)(q, k, v, mask)
 
 
 def forward_layer(cfg, x, w, kv=None, pos=0, live=None, kv_quant_bits=0):
@@ -131,7 +128,7 @@ def forward_layer(cfg, x, w, kv=None, pos=0, live=None, kv_quant_bits=0):
 
     if kv is not None:  # decode: one token per row, pos is per-slot [B, 1]
         upd = jnp.stack([k, v])
-        if kv_quant_bits:  # int-N / fp8 / fp6 / fp4 — see quant.kv_fake_quantize
+        if kv_quant_bits:  # int-N / fp8 / fp4 — see quant.kv_fake_quantize
             upd = quant.kv_fake_quantize(upd, kv_quant_bits)
         kv = jax.vmap(lambda c, u, p: jax.lax.dynamic_update_slice(c, u, (0, p, 0, 0)),
                       in_axes=(1, 1, 0), out_axes=1)(kv, upd, pos[:, 0])
@@ -167,14 +164,12 @@ def forward(cfg, x, weights, kv=None, pos=0, dtype=jnp.bfloat16, logits=True, li
     # blocks optimizer-backward fusion (fp32 masters: 33.7G -> 13.9G temps).
     cast = lambda w: w.astype(dtype) if not is_q(w) and w.ndim > 1 else w
     x = reshard(x, P("data", None))
-    x = quant.take(cast(weights["model.embed_tokens.weight"]), x,
-                   out_sharding=P("data", None, None)).astype(dtype)
+    x = quant.take(cast(weights["model.embed_tokens.weight"]), x, out_sharding=P("data", None, None)).astype(dtype)
 
     # Layer weights are stacked [L, ...]; scanning keeps the compiled program
     # one layer deep, so each layer's remat/backward buffers are reused
     # instead of packed side by side (unrolled: 62 GiB of GPU temps at B128).
-    layers = {k.removeprefix("model.layers."): v
-              for k, v in weights.items() if k.startswith("model.layers.")}
+    layers = {k.removeprefix("model.layers."): v for k, v in weights.items() if k.startswith("model.layers.")}
 
     def layer_fn(x, layer):
         lw, kv_i = layer
@@ -200,12 +195,7 @@ def forward(cfg, x, weights, kv=None, pos=0, dtype=jnp.bfloat16, logits=True, li
 def init_kv(L, K, H, B, T, dtype=jnp.bfloat16):
     # One cache array per layer: a stacked cache would be rewritten whole on
     # every decoded token instead of aliased in the decode loop carry.
-    return [
-        jnp.zeros(
-            (2, B, T, K, H), dtype=dtype,
-            out_sharding=P(None, "data", None, "model", None))
-        for _ in range(L)
-    ]
+    return [jnp.zeros((2, B, T, K, H), dtype, out_sharding=P(None, "data", None, "model", None)) for _ in range(L)]
 
 
 def _head_dim(cfg):
@@ -222,8 +212,9 @@ def _download(source, weights_dir):
     assert not cfg.get("use_sliding_window"), "sliding-window attention is not implemented"
     assert cfg.get("rope_scaling") is None or cfg["rope_scaling"]["rope_type"] == "llama3"
     tokenizer = AutoTokenizer.from_pretrained(path)
-    if tokenizer.pad_token is None:  # llama ships no pad token; 3.1+ reserves this id
-        tokenizer.pad_token = "<|finetune_right_pad_id|>"
+    # Llama 3 tokenizers set no pad token. 128004 is a reserved special token (3.1+ names it <|finetune_right_pad_id|>).
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token_id = 128004
     return path, tokenizer, cfg
 
 
@@ -287,14 +278,9 @@ def load(source, weights_dir="~/.cache/postax/weights", tp=1, fsdp=True):
     jax.set_mesh(jax.make_mesh((jax.device_count() // tp, tp), ("data", "model"),
                                axis_types=(AxisType.Explicit, AxisType.Explicit)))
     path, tokenizer, cfg = _download(source, weights_dir)
-    return Model(
-        weights=_load_weights(path, cfg, fsdp),
-        forward=partial(forward, cfg),
-        head=partial(head, cfg),
-        init_kv=partial(init_kv, cfg["num_hidden_layers"], cfg["num_key_value_heads"], _head_dim(cfg)),
-        tokenizer=tokenizer,
-        config=cfg,
-    )
+    return Model(weights=_load_weights(path, cfg, fsdp), forward=partial(forward, cfg), head=partial(head, cfg),
+                 init_kv=partial(init_kv, cfg["num_hidden_layers"], cfg["num_key_value_heads"], _head_dim(cfg)),
+                 tokenizer=tokenizer, config=cfg)
 
 
 def save(model, output_dir):

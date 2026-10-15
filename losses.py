@@ -34,20 +34,18 @@ DUAL_CLIP = 3.0  # PPO's ratio bound for negative advantages (arXiv:1912.09729)
 
 
 class ISCorrection(NamedTuple):
-    """One point on the IS-correction grid. TIS, MIS, IcePop, PPO, DAPO, GSPO,
-    TOPR and DPPO are all spellings of it (table in README.md)."""
+    """One point on the IS-correction grid. TIS, MIS, PPO, DAPO, GSPO, TOPR and
+    DPPO are all spellings of it (table in README.md)."""
     level: str = "token"   # token | seq_mean (mean log r) | seq_sum (sum log r: trajectory ratio)
     stat: str = "ratio"    # band tests the ratio r, or the TV distance |q - p| (DPPO; high = delta)
     low: float = 0.0       # band [low, high] on r; 0 / inf leave a side open
     high: float = math.inf
     outside: str = "drop"  # clamp: w = nearest bound | drop: w = 0
-    inside: str = "ratio"  # ratio: w = r | one: w = 1 (plain gradient)
     sign: str = "both"     # which advantages get corrected: both | neg | pos (others w = 1)
                            # | ppo: block only moves away from q; A>0: (0, high], A<0: [low, DUAL_CLIP]
 
     def check(self):
-        choices = dict(level=("token", "seq_mean", "seq_sum"), stat=("ratio", "tv"),
-                       outside=("clamp", "drop"), inside=("ratio", "one"),
+        choices = dict(level=("token", "seq_mean", "seq_sum"), stat=("ratio", "tv"), outside=("clamp", "drop"),
                        sign=("both", "neg", "pos", "ppo"))
         for field, allowed in choices.items():
             assert getattr(self, field) in allowed, f"rl.is.{field} must be one of {allowed}"
@@ -71,12 +69,10 @@ def log_mass(log_p, log_q, positive, c, tv=None):
         if c.sign == "ppo":
             in_band |= jnp.where(positive, log_p <= log_q, log_p >= log_q)
     elif c.sign == "ppo":
-        in_band = jnp.where(positive, log_p <= hi,
-                            (log_p >= lo) & (log_p <= log_q + math.log(DUAL_CLIP)))
+        in_band = jnp.where(positive, log_p <= hi, (log_p >= lo) & (log_p <= log_q + math.log(DUAL_CLIP)))
     else:
         in_band = (log_p >= lo) & (log_p <= hi)
-    log_m = jnp.where(in_band, log_p if c.inside == "ratio" else log_q,
-                      jnp.clip(log_p, lo, hi) if c.outside == "clamp" else -jnp.inf)
+    log_m = jnp.where(in_band, log_p, jnp.clip(log_p, lo, hi) if c.outside == "clamp" else -jnp.inf)
     if c.sign == "neg":
         log_m = jnp.where(positive, log_q, log_m)
     if c.sign == "pos":
@@ -128,9 +124,8 @@ def loss_fn_rl(hidden, head, batch, correction=None, score_center=False, chunk=1
     positive = batch["advantages"][:, None] >= 0
     seq_len = targets.shape[1]
     chunk = next(n for n in range(min(chunk, seq_len), 0, -1) if seq_len % n == 0)
-    per_token = {"hidden": hidden, "targets": targets, "mask": mask} | {
-        k: batch[k] for k in ("sampling_token_logprobs", "sampling_vocab_logprobs",
-                              "center_ids", "center_logprobs") if k in batch}
+    sampler_keys = ("sampling_token_logprobs", "sampling_vocab_logprobs", "center_ids", "center_logprobs")
+    per_token = {"hidden": hidden, "targets": targets, "mask": mask} | {k: batch[k] for k in sampler_keys if k in batch}
 
     def chunk_sums(sums, start):
         b = {k: jax.lax.dynamic_slice_in_dim(v, start, chunk, axis=1) for k, v in per_token.items()}
@@ -140,8 +135,7 @@ def loss_fn_rl(hidden, head, batch, correction=None, score_center=False, chunk=1
         tv = sg(jnp.abs(jnp.exp(logq) - jnp.exp(logp)))
         w = is_weight(logp - logq, positive, token_c, tv)
         plogp = sg((jnp.exp(logp_vocab) * logp_vocab).sum(-1))  # E_p[log p] has zero gradient
-        terms = {"score": w * logp, "entropy": -plogp, "kl_samp_train": sg(logq - logp),
-                 "masked": w == 0, "tv": tv}
+        terms = {"score": w * logp, "entropy": -plogp, "kl_samp_train": sg(logq - logp), "masked": w == 0, "tv": tv}
         if score_center and full:
             logq_vocab = b["sampling_vocab_logprobs"].astype(jnp.float32)
             mass = jnp.exp(log_mass(logp_vocab, logq_vocab, positive[..., None], token_c))
@@ -151,8 +145,7 @@ def loss_fn_rl(hidden, head, batch, correction=None, score_center=False, chunk=1
             p_head, q_head = sg(jnp.exp(logp_head)), jnp.exp(logq_head)
             q_tail = 1.0 - q_head.sum(-1)
             rho = jnp.maximum(q_tail, 0.0) / jnp.maximum(1.0 - p_head.sum(-1), 1e-6)
-            terms["kl_head"] = sg((q_head * (logq_head - logp_head)).sum(-1)
-                                  + q_tail * jnp.log(jnp.maximum(rho, 1e-9)))
+            terms["kl_head"] = sg((q_head * (logq_head - logp_head)).sum(-1) + q_tail * jnp.log(jnp.maximum(rho, 1e-9)))
             if score_center:
                 alpha = jnp.exp(log_mass(0.0, jnp.log(rho), positive, token_c))
                 mass = jnp.exp(log_mass(logp_head, logq_head, positive[..., None], token_c))
@@ -163,8 +156,7 @@ def loss_fn_rl(hidden, head, batch, correction=None, score_center=False, chunk=1
     keys = ["score", "entropy", "kl_samp_train", "masked", "tv"]
     keys += ["kl_head"] if "center_ids" in batch else []
     zeros = jnp.zeros_like(batch["advantages"], dtype=jnp.float32)  # per-sequence sums
-    sums, _ = jax.lax.scan(jax.checkpoint(chunk_sums), dict.fromkeys(keys, zeros),
-                           jnp.arange(0, seq_len, chunk))
+    sums, _ = jax.lax.scan(jax.checkpoint(chunk_sums), dict.fromkeys(keys, zeros), jnp.arange(0, seq_len, chunk))
 
     n_tokens = jnp.maximum(mask.sum(), 1)
     advantages = batch["advantages"]

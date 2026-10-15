@@ -17,8 +17,7 @@ def logprobs(forward, weights, tokens, mask):
 
 
 def _chat(tokenizer, messages, **kwargs):
-    return tokenizer.apply_chat_template(
-        messages, tokenize=True, return_dict=False, enable_thinking=False, **kwargs)
+    return tokenizer.apply_chat_template(messages, tokenize=True, return_dict=False, enable_thinking=False, **kwargs)
 
 
 @functools.cache
@@ -78,12 +77,10 @@ def encode(row, tokenizer, seq_len, format):
         messages = [{"role": m["role"], "content": m["content"]} for m in row["messages"]]
         return _pad(*tokenize_chat(tokenizer, messages), seq_len)
     if format == "preference":  # columns 'chosen' / 'rejected', both message lists
-        pair = [encode({"messages": row[k]}, tokenizer, seq_len, "chat")
-                for k in ("chosen", "rejected")]
+        pair = [encode({"messages": row[k]}, tokenizer, seq_len, "chat") for k in ("chosen", "rejected")]
         if None in pair:
             return None
-        return {f"{k}_{name}": v for k, ex in zip(("chosen", "rejected"), pair)
-                for name, v in ex.items()}
+        return {f"{k}_{name}": v for k, ex in zip(("chosen", "rejected"), pair) for name, v in ex.items()}
     raise ValueError(f"unknown data.format {format!r}")
 
 

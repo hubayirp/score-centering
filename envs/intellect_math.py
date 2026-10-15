@@ -28,10 +28,7 @@ def bounded_verify_response(response, answer, max_verify_chars, timeout_seconds)
     """verify_response in a child process that is killed if it hangs."""
     ctx = multiprocessing.get_context("fork")  # worker is single-threaded
     parent_conn, child_conn = ctx.Pipe(duplex=False)
-    child = ctx.Process(
-        target=_child_verify,
-        args=(child_conn, response, answer, max_verify_chars, timeout_seconds),
-    )
+    child = ctx.Process(target=_child_verify, args=(child_conn, response, answer, max_verify_chars, timeout_seconds))
     child.start()
     child_conn.close()
     try:
@@ -52,12 +49,10 @@ class BoundedMathRubric(MathRubric):
         response = parser.parse_answer(completion) or ""
         if len(response) > self.max_verify_chars:
             return 0.0
+        verify = partial(bounded_verify_response, response, answer, self.max_verify_chars, int(self.timeout_seconds))
         try:
             reward, elapsed = await asyncio.wait_for(
-                asyncio.get_running_loop().run_in_executor(
-                    self.executor, bounded_verify_response, response, answer,
-                    self.max_verify_chars, int(self.timeout_seconds)),
-                timeout=self.HARD_TIMEOUT_SECONDS)
+                asyncio.get_running_loop().run_in_executor(self.executor, verify), timeout=self.HARD_TIMEOUT_SECONDS)
         except Exception as e:  # includes the (backstop) hard timeout
             self.logger.warning(f"math-verify failed: {e!r}")
             return 0.0

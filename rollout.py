@@ -20,8 +20,7 @@ def tokenize_prompt(messages, tokenizer, prompt_format):
     text: the message contents as a plain continuation (Base models)."""
     if prompt_format == "chat":
         return tokenizer.apply_chat_template(
-            messages, add_generation_prompt=True, tokenize=True, return_dict=False,
-            enable_thinking=False)
+            messages, add_generation_prompt=True, tokenize=True, return_dict=False, enable_thinking=False)
     assert prompt_format == "text", prompt_format
     text = "\n\n".join(message["content"] for message in messages)
     return tokenizer.encode(text if text.endswith("\n") else text + "\n", add_special_tokens=False)
@@ -54,12 +53,9 @@ def completions(tokens, prompt_lengths, tokenizer):
 
 
 def score(rubric, rows, texts, group_size):
-    states = [
-        vf.State(input=row, prompt=row["prompt"], trajectory=[],
-                 completion=[vf.AssistantMessage(content=text)],
-                 answer=row.get("answer", ""), info=row.get("info", {}))
-        for row, text in zip(rows, texts)
-    ]
+    states = [vf.State(input=row, prompt=row["prompt"], trajectory=[], completion=[vf.AssistantMessage(content=text)],
+                       answer=row.get("answer", ""), info=row.get("info", {}))
+              for row, text in zip(rows, texts)]
 
     async def score_all():
         if rubric.has_group_rewards:

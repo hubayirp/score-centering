@@ -10,11 +10,11 @@ Score centering stabilizes RL under training-inference mismatch (TIM) by canceli
 
 ## Score Centering: loss function
 
-We store the sampler's top-k logprobs (k=128) and model the tail with the trainer's distribution, rescaled to match the sampler's tail mass. Both k=128 and k=32 matched full score centering in our experiments.
+We store the sampler's top-k logprobs (k=128) and model the tail with the trainer's distribution, rescaled to match the sampler's tail mass.
 
 The implementations below return a loss per token. `train_logp` has shape `[..., V]`; `samp_logp` and `topk_ids` have shape `[..., k]`. Sampled token IDs and logprobs have shape `[...]`; advantages broadcast to that shape. Use float32 logprobs, without renormalizing the top-k head, and retain the sampled token's logprob even when it falls outside the head.
 
-Omit `weight_fn` for score centering alone, or pass `tis_weight` / `mis_weight` to compose it with truncated / masked importance sampling.
+Omit `weight_fn` for vanilla score centering, or pass `tis_weight` / `mis_weight` to compose SC with truncated / masked importance sampling.
 
 <details>
 <summary><b>JAX</b></summary>
@@ -101,10 +101,9 @@ In [`losses.py`](losses.py) every off-policy correction is REINFORCE with a deta
 - `level`: the weight is per token or per sequence;
 - band `[low, high]`: where the ratio, or for DPPO the TV distance, may lie;
 - `outside`: what happens outside the band (`clamp` or `drop`);
-- `inside`: what happens inside it (keep the ratio, or use 1);
 - `sign`: which advantages get corrected.
 
-Score centering (`rl.sc=true`) subtracts the expected score under the effective sampling mass q·w, and composes with every `stat=ratio` correction. Settings not listed take their default (`level=token stat=ratio low=0 high=inf outside=drop inside=ratio sign=both`):
+Score centering (`rl.sc=true`) subtracts the expected score under the effective sampling mass q·w, and composes with every `stat=ratio` correction. Settings not listed take their default (`level=token stat=ratio low=0 high=inf outside=drop sign=both`):
 
 | Method | `rl.is.*` settings |
 | --- | --- |
@@ -112,7 +111,6 @@ Score centering (`rl.sc=true`) subtracts the expected score under the effective 
 | Naive IS | `level=token` |
 | TIS | `high=2.0 outside=clamp` |
 | MIS | `low=0.5 high=5.0` |
-| IcePop | `low=0.5 high=5.0 inside=one` |
 | PPO | `low=0.8 high=1.2 sign=ppo` |
 | DAPO | `low=0.8 high=1.28 sign=ppo` |
 | GSPO | `level=seq_mean low=0.9997 high=1.0004 sign=ppo` |
@@ -121,17 +119,15 @@ Score centering (`rl.sc=true`) subtracts the expected score under the effective 
 
 With the top-k sampler head (`sampler.vocab_logprobs=k`), the sampler's tail is modeled as proportional to the trainer's, rescaled to match its mass. `sampler.vocab_logprobs=full` gives exact centering.
 
-## Code
+## Training framework: postax
 
-The code is a small JAX stack. It loads and saves HF checkpoints for Llama, Qwen2, Qwen3 and Qwen3-MoE, and supports tensor, FSDP and expert parallelism. Sampling is JIT-compiled, and sampler logprobs stay in HBM.
+Score centering was developed in **postax**, a JAX framework I built for LLM full-stack research. This repo includes a slimmed-down version of the framework, with features beyond score centering:
 
-| File | Contents |
-| --- | --- |
-| [`train_rl.py`](train_rl.py) | Config, mismatched sampler (staleness, weight noise, int8/fp8 weights, KV-cache quantization) and training loop |
-| [`losses.py`](losses.py) | Advantages, the IS-correction grid, score centering, the RL loss |
-| [`rollout.py`](rollout.py), [`envs/`](envs) | Prompting, completion masks and scoring with [verifiers](https://github.com/PrimeIntellect-ai/verifiers) environments (Countdown, INTELLECT-2 math) |
-| [`models/`](models) | Transformer forward pass, sampling with top-k logprob collection, 8-bit quantization |
-| [`train_lm.py`](train_lm.py), [`train_dpo.py`](train_dpo.py), [`lm_utils.py`](lm_utils.py) | Minimal SFT and DPO/SimPO trainers on Hugging Face datasets, independent of the RL code |
+- SFT, DPO, RL
+- Llama 3–3.3, Qwen2, Qwen3, Qwen3-MoE (load + save HF checkpoint)
+- TP, DP, FSDP, EP
+
+Sampling is JIT-compiled, and sampler logprobs stay in HBM (no CPU roundtrip)!
 
 ## Example: RL run
 
@@ -142,7 +138,7 @@ python train_rl.py model.source=Qwen/Qwen3-0.6B env.id=countdown \
   rl.sc=true rl.is.level=token rl.is.high=2.0 rl.is.outside=clamp
 ```
 
-Use `log.wandb_mode=disabled` to run without W&B. Models are cached in `~/.cache/postax/weights`, and configs and metrics go to `outputs/`.
+Use `log.wandb_mode=disabled` to run without W&B. Models are cached in `~/.cache/postax/weights`, and configs and metrics go to `outputs/`. SFT and DPO use `train_lm.py` and `train_dpo.py`.
 
 ## Paper sweeps
 
@@ -180,7 +176,7 @@ uv pip install -r requirements.txt "intellect-math==0.1.7" \
 If you use Score Centering in your work or find our results useful, please consider citing our paper as follows:
 
 ```
-@misc{marek2026scorecentering,
+@misc{score_centering,
       title={Score Centering Stabilizes Off-policy Reinforcement Learning}, 
       author={Martin Marek and Max Ryabinin},
       year={2026},

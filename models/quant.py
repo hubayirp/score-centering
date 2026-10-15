@@ -37,18 +37,15 @@ def quantize_tree(weights, dtype):
         q, scale = quantize(w, dtype, contract_dims=2 if "o_proj" in k else 1)
         return QArray(q, reshard(scale, P()))
 
-    return {k: w if w.ndim <= 1 or "norm" in k or "bias" in k or k.endswith("mlp.gate.weight") else quantize_weight(k, w)
-            for k, w in weights.items()}
+    keep = lambda k, w: w.ndim <= 1 or "norm" in k or "bias" in k or k.endswith("mlp.gate.weight")
+    return {k: w if keep(k, w) else quantize_weight(k, w) for k, w in weights.items()}
 
 
 # Mini-float formats for _snap_float: (mantissa bits, max value, min normal
 # exponent). Grid-snapped explicitly rather than via astype round-trips,
 # which XLA's GPU simplifier folds away entirely (verified: convert
 # bf16->fp8->f32 under jit is the identity — a silent no-op quantizer).
-_FLOAT_GRIDS = {
-    jnp.float8_e4m3fn: (3, 448.0, -6),
-    jnp.float4_e2m1fn: (1, 6.0, 0),
-}
+_FLOAT_GRIDS = {jnp.float8_e4m3fn: (3, 448.0, -6), jnp.float4_e2m1fn: (1, 6.0, 0)}
 
 
 def _snap_float(x, dtype):
@@ -82,8 +79,7 @@ def qeinsum(eq, x, w, preferred_element_type=None, out_sharding=None):
     """jnp.einsum that runs the contraction in 8 bit when w is a QArray;
     contraction axes must be trailing in both operands."""
     if not isinstance(w, QArray):
-        return jnp.einsum(eq, x, w, preferred_element_type=preferred_element_type,
-                          out_sharding=out_sharding)
+        return jnp.einsum(eq, x, w, preferred_element_type=preferred_element_type, out_sharding=out_sharding)
     contract_dims = w.q.ndim - w.scale.ndim
     lhs, rhs = eq.split("->")[0].split(",")
     assert lhs[-contract_dims:] == rhs[-contract_dims:], f"contraction not trailing in {eq}"
@@ -116,8 +112,7 @@ def qragged_dot(x, w, group_sizes, expert_ids):
         # cotangents produced by the kernel's empty-group tile.
         active = (group_sizes > 0)[:, None, None]
         w = jnp.where(active, w, jax.lax.stop_gradient(w))
-        return tokamax.ragged_dot(x, w, group_sizes,
-                                  implementation=("triton", "xla"))
+        return tokamax.ragged_dot(x, w, group_sizes, implementation=("triton", "xla"))
     xq = quantize(x, w.q.dtype, 1)
     # tokamax's grouped-matmul kernels (fwd + both grads) replace both the
     # masked-dense XLA lowering (whose [El, rows, width] f32 intermediates
@@ -125,9 +120,8 @@ def qragged_dot(x, w, group_sizes, expert_ids):
     # released wheel; bf16-only on sm_100). 8-bit grids are applied above and
     # are exact in bf16/f32, so contracting dequantized values keeps W8A8
     # numerics up to accumulator rounding.
-    y = tokamax.ragged_dot(
-        xq.q.astype(jnp.bfloat16), w.q.astype(jnp.bfloat16), group_sizes,
-        preferred_element_type=jnp.float32, implementation=("triton", "xla"))
+    y = tokamax.ragged_dot(xq.q.astype(jnp.bfloat16), w.q.astype(jnp.bfloat16), group_sizes,
+                           preferred_element_type=jnp.float32, implementation=("triton", "xla"))
     return (y * xq.scale[:, None] * w.scale[expert_ids]).astype(x.dtype)
 
 

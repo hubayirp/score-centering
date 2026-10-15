@@ -49,7 +49,6 @@ rl:
     low: 0.0
     high: .inf     # CLI overrides accept plain inf
     outside: drop  # clamp | drop
-    inside: ratio  # ratio | one
     sign: both     # both | neg | pos | ppo
 env:
   id: countdown
@@ -79,9 +78,8 @@ def fixed_weight_delta(weights, key, scale):
     """Relative Gaussian weight perturbation, drawn once per run."""
     leaves, structure = jax.tree.flatten(weights)
     keys = jax.random.split(key, len(leaves))
-    return jax.tree.unflatten(structure, [
-        scale * jax.random.normal(k, w.shape, w.dtype, out_sharding=w.sharding) * w
-        for k, w in zip(keys, leaves)])
+    deltas = [scale * jax.random.normal(k, w.shape, w.dtype, out_sharding=w.sharding) * w for k, w in zip(keys, leaves)]
+    return jax.tree.unflatten(structure, deltas)
 
 
 def train(cfg):
@@ -92,9 +90,8 @@ def train(cfg):
     optimizer = utils.make_optimizer(cfg.opt.optimizer, cfg.opt.lr)
     opt_state = optimizer.init(model.weights)
     run_dir = utils.start_run(cfg)
-    is_cfg = cfg.rl["is"]
-    correction = None if is_cfg.level is None else losses.ISCorrection(
-        **{**is_cfg, "low": float(is_cfg.low), "high": float(is_cfg.high)}).check()
+    is_cfg = {**cfg.rl["is"], "low": float(cfg.rl["is"].low), "high": float(cfg.rl["is"].high)}
+    correction = None if is_cfg["level"] is None else losses.ISCorrection(**is_cfg).check()
 
     # Sampler: its own mesh, and weights that are a (possibly stale, noisy,
     # quantized) snapshot of the trainer's.
@@ -105,13 +102,10 @@ def train(cfg):
     quantized = sampler_dtype.itemsize == 1
     float_dtype = jnp.bfloat16 if quantized else sampler_dtype
     copy_to_sampler = jax.jit(
-        lambda weights: {k: w.astype(float_dtype) if w.ndim > 1 and "norm" not in k else w
-                         for k, w in weights.items()},
+        lambda weights: {k: w.astype(float_dtype) if w.ndim > 1 and "norm" not in k else w for k, w in weights.items()},
         out_shardings={k: NamedSharding(sampler_mesh, w.sharding.spec) for k, w in model.weights.items()})
-    noise = None
-    if cfg.sampler.weight_noise_scale:
-        noise = copy_to_sampler(fixed_weight_delta(
-            model.weights, jax.random.fold_in(key, 2), cfg.sampler.weight_noise_scale))
+    scale = cfg.sampler.weight_noise_scale
+    noise = copy_to_sampler(fixed_weight_delta(model.weights, jax.random.fold_in(key, 2), scale)) if scale else None
 
     @partial(jax.jit, donate_argnums=() if quantized else (0,))
     def perturb_and_quantize(weights, noise):
@@ -152,14 +146,12 @@ def train(cfg):
                 logprobs_topk=vocab_logprobs if isinstance(vocab_logprobs, int) else 0)
             host_tokens = np.asarray(tokens)
         mask, lengths, texts = rollout.completions(host_tokens, prompt_lengths, model.tokenizer)
-        batch = {"tokens": reshard(tokens, token_sharding),
-                 "mask": jax.device_put(mask, token_sharding),
+        batch = {"tokens": reshard(tokens, token_sharding), "mask": jax.device_put(mask, token_sharding),
                  "sampling_token_logprobs": reshard(token_logprobs, token_sharding)}
         if head_ids is not None:
             batch |= {"center_ids": reshard(head_ids, head_sharding),
                       "center_logprobs": reshard(head_logprobs, head_sharding)}
-        truncated = ((prompt_lengths + lengths >= seq_len)
-                     & (host_tokens[:, -1] != model.tokenizer.eos_token_id))
+        truncated = (prompt_lengths + lengths >= seq_len) & (host_tokens[:, -1] != model.tokenizer.eos_token_id)
         stats = {"mean_completion_len": lengths.mean(), "frac_truncated": truncated.mean()}
         return batch, vocab, rollout.score(env.rubric, rows, texts, group_size), stats
 

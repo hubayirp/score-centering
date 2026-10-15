@@ -63,8 +63,7 @@ def train(cfg):
         """Summed logprob and token count of the chosen and rejected responses."""
         out = []
         for side in ("chosen", "rejected"):
-            logp, mask = lm_utils.logprobs(
-                model.forward, weights, batch[f"{side}_tokens"], batch[f"{side}_mask"])
+            logp, mask = lm_utils.logprobs(model.forward, weights, batch[f"{side}_tokens"], batch[f"{side}_mask"])
             out.append(((logp * mask).sum(1), mask.sum(1)))
         return out
 
